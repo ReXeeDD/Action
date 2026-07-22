@@ -1,0 +1,43 @@
+# --- Generated artifacts (all regenerable from code) ---
+# leaf-fall trajectories from generate_data.py
+data/
+# checkpoints, videos, plots, logs
+runs/
+*.mp4
+*.pt
+*.ckpt
+*.npy
+*.png
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Tooling / logs ---
+*.log
+tensorboard/
+wandb/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
