@@ -72,8 +72,12 @@ project the predicted future into that rendered view. This removes all three wal
    physical rollout guard (clamp to bounds, freeze-at-ground). The honest long-range answer.
 4. **Camera mirage (in-sim)** — ✅ done. Side cam = watch the whole descent; chase cam =
    leaf-centered. Best demo = **side cam**.
-5. **Memory / attention model** — 🔜 NEXT (see §7, §8). Sequence model over a long lookback.
-6. **Lagrangian/Hamiltonian "Action" net** — ⬜ planned. Dissipative (drag) least-action net
+5. **Memory / attention model** — ✅ DONE and it worked (see §12). Transformer context
+   encoder + GRU rollout decoder, trained with a multi-step position loss.
+6. **Live demo** — ✅ DONE (`action/live.py`): fresh random drops, blind prediction,
+   predicted landing called before it happens.
+7. **Multi-world scale-up** — 🔜 IN PROGRESS (see §13): ball, n-link pendulums, n-body.
+8. **Lagrangian/Hamiltonian "Action" net** — ⬜ planned. Dissipative (drag) least-action net
    is the under-explored novel corner.
 
 ---
@@ -230,6 +234,117 @@ Good centered fluttery demo episodes: 25, 53, 252, 144.
 
 ---
 
+## 12. RESULTS — the memory model (the main outcome so far)
+
+The user's idea: don't feed the net the physics (mass, wind, temperature) — let it **watch**
+and build its own memory of how *this* object interacts with *this* air, then predict from it.
+Built as `TrajContextEncoder` (Transformer attends over a long history → a 96-d context vector
+`z`) + `SeqPredictor` (GRU decoder that re-reads `z` at **every** rollout step), trained with a
+**multi-step position loss** (`action/train_memory.py`).
+
+### What actually moved the needle (in order of impact)
+
+| Change | whole-fall val RMSE | window @50% watched |
+|---|---|---|
+| v2, Fourier time-clock mistuned to 0.05–1.2 rad/step | plateaued 53 cm | — |
+| v2.1, **clock retuned to the leaf's real sway band** (0.008–0.25) | 34.4 cm | 0.40 m |
+| v3, **attention pooling + decoder 128→256 + encoder 64→96/3 layers** | **30.6 cm** | **0.79 m** |
+
+Three lessons worth keeping:
+
+1. **Train on the metric you care about.** Per-step *delta* loss let tiny biases integrate into
+   huge drift. Adding a cumulative **position loss in metres**, differentiated through the whole
+   rollout, was a step change.
+2. **Give a periodic system a clock.** The sway force is a function of the step counter. A bare
+   GRU cannot hold that phase over 200 autoregressive steps. A Fourier time-clock fixed it — but
+   only once its frequency band was **matched to the actual physics** (`leaf_world` drives at
+   `f*{0.7..2.7}` with `f∈[0.025,0.045]`). A mistuned clock is worthless; that one retune took
+   53 cm → 34 cm.
+3. **Measure the right thing.** "Window from 12 frames watched" is **information-limited** —
+   12 frames is ~6 % of the 1.6 s sway cycle, so no model can identify the environment yet. It
+   sat at ~0.25 m no matter what we did. The honest metrics are **window vs. how much was
+   watched** and the **sharpen curve**, both of which improved dramatically.
+
+### The headline
+Prediction **sharpens as the object falls**, exactly as the user predicted:
+
+```
+watched 20% of fall: WINDOW = 0.45 m ahead
+watched 35% of fall: WINDOW = 0.58 m ahead
+watched 50% of fall: WINDOW = 0.79 m ahead      (+0.48s error: 29.4 -> 14.6 -> 10.5 cm)
+```
+
+### Live demo (`action/live.py`)
+Drops **fresh** leaves (random release point over a ±1.5 m zone, random height 2.2–3.8 m, fresh
+air/wind/sway — none of it in the training set) and predicts **blind**: at every frame the model
+sees only what it has watched, rolls the future forward, and **calls its own landing spot** by
+cutting the predicted path at the first predicted ground contact. Real run:
+
+```
+drop 1: from (-0.69,-1.38) at 2.23m | landing call after 25%: 55.1cm  50%: 16.9cm  75%:  5.9cm
+drop 2: from (+0.94,+1.24) at 3.17m | landing call after 25%: 55.5cm  50%: 44.8cm  75%: 15.7cm
+drop 3: from (+0.13,+1.31) at 3.51m | landing call after 25%: 59.4cm  50%: 39.5cm  75%:  8.6cm
+drop 4: from (-1.49,+1.07) at 2.25m | landing call after 25%: 41.1cm  50%: 28.9cm  75%:  6.4cm
+```
+Monotonic on every drop. Generalization to unseen release points/heights comes free from
+**translation invariance** — the model never sees absolute coordinates.
+
+### Why it works this well (and the honest caveat)
+The environment is only ~8 hidden constants (density, wind×3, mass, sway amp/freq/phase), fixed
+per fall; motion is the integral of force, so the trajectory is a **fingerprint** of them — this
+is learned system identification. And because we made the world **deterministic** (Lyapunov ≈ 0,
+§6c), once those constants are pinned the rest of the fall is *determined*, and a periodic force
+is computable arbitrarily far ahead — which is why long-horizon predictions work, not just short
+ones. **Caveat, stated plainly: it predicts this well largely because we removed the randomness.
+A real leaf, with genuine turbulence, would not be this predictable and no model could make it
+so.** That is why the next phase adds genuinely chaotic worlds.
+
+---
+
+## 13. Multi-world scale-up (`action/worlds/`)
+
+Moving beyond the leaf to many systems, with **real** physics (no imposed forcing anywhere).
+
+| File | World | Physics |
+|---|---|---|
+| `worlds/ball.py` | `ball` | solid ball launched in **any** direction; real contacts, restitution, friction, drag |
+| `worlds/pendulum.py` | `pendulum1..N` | n-link chained pendulum; exact rigid-body dynamics under gravity |
+| `worlds/nbody.py` | `nbody2..N` | n point masses under **real Newtonian mutual gravitation**, computed pairwise and applied via `xfrc_applied` (MuJoCo has no inter-body gravity), Plummer softening, zero uniform gravity, contacts off |
+
+`worlds/base.py` defines the interface; `worlds/__init__.py` is the registry (`make_world`).
+A universal state convention (`state = qpos ++ qvel`) plus two index maps — `pos_groups` (3D
+positions, made relative for translation invariance) and `quat_groups` (quaternions to
+renormalize each step) — let the pipeline stay physics-agnostic. `generate_data.py --world <name>`
+writes a `meta.json` with that layout.
+
+### Measured chaos (separation growth from a 1e-6 perturbation over 7.2 s)
+
+| world | growth | verdict |
+|---|---|---|
+| ball | 1× | predictable (ballistic) |
+| pendulum1 | 28× | predictable (**integrable**) |
+| nbody2 | 5× | predictable (**Kepler — integrable**) |
+| pendulum2 | 73× | mildly chaotic (mixed phase space) |
+| nbody3 | 29× | mostly regular at this timescale |
+| pendulum3 | **679,000×** | **CHAOTIC** |
+| nbody4 | **4,400×** | **CHAOTIC** |
+| pendulum4 | **1,652,000×** | **CHAOTIC** |
+
+This is physically correct — the two *integrable* systems stay predictable and chaos switches on
+with the third link / fourth body. **This is the scientific complement to the leaf:** there the
+horizon was self-inflicted and removable; here it is a genuine physical wall. Calibration notes:
+N-body needed `G=15` (at `G=1` an episode covered less than one orbit), and pendulum damping had
+to be cut to ≤0.004 or friction suppressed the very chaos the world exists to show.
+
+### Still to do for the scale-up
+The training pipeline is still leaf-shaped (hardcoded `STATE_DIM=13`, positions at `[0:3]`,
+quaternion at `[3:7]`). To train these worlds, `dataset.py`, `train_memory.py` and
+`models.py::SeqPredictor.decode` must read `pos_groups`/`quat_groups` from `meta.json` instead.
+Then: per-world models first, and a **prediction-horizon vs. measured-Lyapunov** comparison
+across all worlds — the honest headline result this project has been building toward.
+
+---
+
 ## 11. Edit log (chronological, why each change)
 
 - **World + pipeline built** — leaf in ellipsoid fluid model; parallel data gen; MLP baseline;
@@ -251,6 +366,25 @@ Good centered fluttery demo episodes: 25, 53, 252, 144.
 - **Deterministic regen + retrain** — window did NOT open; diagnosed 48 ms history too short to
   infer the ~1.6 s sway → **memory model is the required next step**. (§6d, §7)
 - **This CLAUDE.md written.**
+- **Memory model built** — `TrajContextEncoder` + `SeqPredictor` + `train_memory.py`. Killed the
+  compounding explosion; confirmed "sharpens as it falls."
+- **Streaming memory + train-to-landing** — encoder reads all history so far (padded/masked),
+  decoder trained over the full remaining horizon.
+- **Regularization** (input-noise aug, denser val stride 20, weight decay 3e-4) — fixed a val
+  flatline at 13.2 → 9.7. *But it did not move the window*, which is how we learned the window
+  was information-limited, not model-limited.
+- **Position loss + Fourier time-clock** — trained on cumulative metres and gave the decoder a
+  clock. Then **retuned the clock band to the real sway frequencies** (the mistuned band was
+  worthless): 53 cm → 34.4 cm.
+- **v3 capacity + attention pooling** — 30.6 cm, window 0.40 → **0.79 m**.
+- **Gradient checkpointing** on the rollout (`--ckpt-chunk`) — required to fit v3; two
+  independent OOM sources: encoder attention is O(L²·batch), decoder backprop is
+  O(fut_cap·batch·dec_hidden).
+- **`live.py`** — fresh randomized drops, blind prediction, self-called landing. Its first
+  landing-error report was **misleading** (measured at the last frame, when the leaf had already
+  landed and only one step remained); fixed to report the call after 25/50/75 % watched.
+- **`worlds/` package** — ball, n-link pendulum, n-body under real Newtonian gravitation;
+  world-agnostic `generate_data.py --world` + `meta.json`. Measured the chaos spectrum.
 ```
 Remember: report outcomes faithfully. When a prediction turns out wrong (e.g. "determinism
 will open the window"), say so plainly and explain what the measurement actually showed.

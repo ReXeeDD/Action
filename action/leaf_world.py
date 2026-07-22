@@ -58,12 +58,14 @@ def leaf_mjcf(
     <!-- Fixed camera looking along +y at the fall column. Image x = world +x,
          image up = world +z, so the projection math is exact and simple. -->
     <camera name="side" pos="0 -6 1.5" xyaxes="1 0 0 0 0 1" fovy="45"/>
+    <!-- Wide fixed camera for the live demo: sees a big drop zone, so leaves
+         released from different spots/heights all stay in frame. -->
+    <camera name="wide" pos="0 -9 2.2" xyaxes="1 0 0 0 0 1" fovy="60"/>
     <body name="leaf" pos="0 0 {start_height}">
       <freejoint name="root"/>
       <!-- A flat oval: looks like a leaf and its ellipsoid fluid interaction is exact. -->
       <geom name="leaf" type="ellipsoid" size="{sx} {sy} {sz}" mass="{leaf_mass}"
-            fluidshape="ellipsoid"
-            fluidcoef="0.5 0.25 1.5 1.0 1.0"
+            fluidshape="ellipsoid" fluidcoef="0.5 0.25 1.5 1.0 1.0"
             rgba="0.45 0.72 0.18 1"/>
       <!-- Chase camera: follows the leaf's position (no rotation with its tumble),
            so any fall stays centered and the predicted cone stays in view. -->
@@ -128,7 +130,9 @@ class LeafWorld:
                                start_h]
         self.data.qpos[QUAT] = quat
         self.data.qvel[0:3] = self.rng.normal(0.0, 0.2, size=3)     # linear (qvel layout)
-        self.data.qvel[3:6] = self.rng.normal(0.0, 3.0, size=3)     # angular, spin it
+        # only a gentle initial spin: a large one made the leaf tumble steadily the
+        # whole way down (straight path), instead of rocking about broadside
+        self.data.qvel[3:6] = self.rng.normal(0.0, 0.8, size=3)
         mujoco.mj_forward(self.model, self.data)
         return self.state()
 
@@ -145,18 +149,10 @@ class LeafWorld:
         function of state+phase, so it is learnable within the true chaos horizon.
         Per-episode variety still comes from the randomized amplitude/freq/phase set
         once in reset(); it just no longer changes every step."""
-        a, f, ph, k = self._sway_amp, self._sway_freq, self._sway_phase, self._k
-        side = a * np.array([np.sin(f * k + ph[0]),
-                             0.6 * np.cos(0.8 * f * k + ph[1]),
-                             0.0])
-        # second incommensurate component replaces the old turbulent noise term
-        side += 0.3 * a * np.array([np.sin(2.31 * f * k + ph[1]),
-                                    np.cos(1.73 * f * k + ph[0]),
-                                    0.0])
-        self.data.xfrc_applied[self._bid, 0:3] = side
-        self.data.xfrc_applied[self._bid, 3:6] = 1.5e-4 * np.array(
-            [np.sin(1.9 * f * k + ph[0]), np.cos(2.7 * f * k + ph[1]),
-             np.sin(0.7 * f * k)])
+        # No bespoke force model. Gravity, air drag/lift and contacts all come
+        # from the engine's UNIVERSAL physics, exactly as they do for every other
+        # body — which is what lets an arbitrary new object be dropped in and
+        # simulated correctly with no extra code.
         self._k += 1
 
     def step(self, n_substeps: int = 1) -> np.ndarray:

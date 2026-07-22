@@ -53,7 +53,8 @@ def _draw_marker(img, uv, front, color, r=7):
 
 
 def make_mirage(episode, ckpt, out, W=720, H=540, stride=3, horizon=None,
-                ensemble=None, samples=60, fps=30, cam="chase", temperature=1.0):
+                ensemble=None, samples=60, fps=30, cam="chase", temperature=1.0,
+                memory=None):
     device = "cpu"
     world = LeafWorld(seed=0)
     world.reset(randomize=False)
@@ -64,6 +65,10 @@ def make_mirage(episode, ckpt, out, W=720, H=540, stride=3, horizon=None,
     if ensemble:
         from action.cone import load_ensemble, sample_futures
         members, xn, yn, history = load_ensemble(ensemble, device)
+    elif memory:
+        from action.train_memory import load_mem, mem_predict
+        net, hist_cap, fm, fs, dm, dsd = load_mem(memory, device)
+        history = 12   # min frames to watch before the memory can say anything
     else:
         net, xn, yn, history = load_model(ckpt, device)
 
@@ -104,6 +109,17 @@ def make_mirage(episode, ckpt, out, W=720, H=540, stride=3, horizon=None,
             uv_l, fr_l = project(model_mj, data, cid, land, W, H)
             for p, f in zip(uv_l, fr_l):
                 _draw_marker(img, p, f, ORANGE, r=4)
+        elif memory:
+            # the memory model watches EVERYTHING so far (traj[:t+1]) and predicts
+            # the rest of the fall — the line tightens onto truth as it descends.
+            m_steps = n_steps - 1
+            if m_steps >= 2:
+                pred = mem_predict(net, hist_cap, fm, fs, dm, dsd,
+                                   traj[:t + 1], traj[t], m_steps, device)
+                uv_p, fr_p = project(model_mj, data, cid, pred[:, 0:3], W, H)
+                _draw_polyline(img, uv_p, fr_p, ORANGE, thickness=2, alpha=0.95)
+                uv_pl, fr_pl = project(model_mj, data, cid, pred[-1:, 0:3], W, H)
+                _draw_marker(img, uv_pl[0], fr_pl[0], ORANGE, r=8)
         else:
             pred = predict_future(net, xn, yn, history, seed_window,
                                   n_steps=n_steps, device=device)
@@ -134,6 +150,8 @@ def main():
     ap.add_argument("--episode", type=int, default=0)
     ap.add_argument("--ckpt", type=str, default="runs/leaf_mlp.pt")
     ap.add_argument("--ensemble", type=str, default=None)
+    ap.add_argument("--memory", type=str, default=None,
+                    help="seq memory model ckpt (runs/leaf_mem.pt) — single sharpening line")
     ap.add_argument("--samples", type=int, default=60)
     ap.add_argument("--out", type=str, default="runs/mirage.mp4")
     ap.add_argument("--stride", type=int, default=3)
@@ -145,7 +163,7 @@ def main():
     eps = load_episodes(args.data)
     make_mirage(eps[args.episode], args.ckpt, args.out, stride=args.stride,
                 horizon=args.horizon, ensemble=args.ensemble, samples=args.samples,
-                temperature=args.temperature, cam=args.cam)
+                temperature=args.temperature, cam=args.cam, memory=args.memory)
 
 
 if __name__ == "__main__":
