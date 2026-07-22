@@ -345,6 +345,121 @@ across all worlds — the honest headline result this project has been building 
 
 ---
 
+## 14. The general predictor — universal representation + universal physics
+
+Two corrections from the user reshaped this phase:
+
+1. *"Limit the prediction to ONE object at a time"* — not multi-body scene prediction. But
+   **any new object, in any environment, must work with no retraining**, and an episode runs
+   **until the body comes to rest**.
+2. *"The physics must be the same for every body — otherwise how can we import a general
+   entity and just run it?"* — which caught a real design violation (see below).
+
+### 14a. Universal representation (`action/entities.py`)
+Every object in every world is described by the **same 13 numbers in world coordinates**:
+position(3) + quaternion(4) + linear velocity(3) + angular velocity(3), read straight from
+MuJoCo. Because the model's input/output size never changes, a brand-new object type is just
+more data in the same format — **that is what makes "no retraining" true**. `entity_attrs()`
+also exposes static identity (mass, inertia, size). `world.target_rollout()` emits `(T,13)` for
+the single target body and stops when it comes to rest. `target_index` = tip link for pendulums,
+0 otherwise. Every world's `meta.json` therefore reports `state_dim=13`, `pos_groups=[[0,1,2]]`,
+`quat_groups=[[3,4,5,6]]` — **always**.
+
+**Key consequence:** the existing `train_memory.py` / `SeqPredictor` (13-dim, pos `[0:3]`, quat
+`[3:7]`) works UNCHANGED on every world. No pipeline generalization was needed.
+
+### 14b. UNIVERSAL PHYSICS (the important correction)
+I had given the ball and the leaf **hand-written force models** (`-c*v` drag; a bespoke
+`_aero()`). That silently broke the whole premise: an imported cube or sheet of paper would get
+**no aerodynamics at all**, because nobody had written a model for it. Both were **deleted**.
+
+Now there is one set of laws, applied by the engine to any geometry:
+gravity · contacts + friction + restitution · fluid drag/lift · Newtonian mutual gravitation.
+`MujocoWorld.physics_options()` emits the shared `<option>` block; `MujocoWorld.apply_forces()`
+holds the *only* remaining force law (mutual gravitation, off unless `grav_const>0`). Worlds
+differ **only in environment parameters** (air density 1.2 vs vacuum, gravity 9.81 vs 0,
+mutual-G 0 vs 15) — legitimate, and exactly what the model must infer.
+
+`worlds/generic.py` proves it: `object` / `object_{sphere,box,plate,capsule,cylinder}` drops an
+arbitrary shape with **zero special-case code**. Behaviour differs purely from geometry —
+plate travels 1.75 m (glides), box settles in 2.9 s, sphere rolls 13.6 m.
+
+**Honest cost:** without its bespoke aero the leaf now *glides* instead of fluttering. The
+flutter was the fake part; this is what universal physics actually produces for a plate.
+
+### 14c. Measured chaos (real physical horizons, unlike the leaf)
+Separation growth from a 1e-6 perturbation over 7.2 s: ball 1x, pendulum1 28x, nbody2 5x (both
+**integrable → predictable, correct**), pendulum2 73x, nbody3 29x, **pendulum3 679,000x,
+nbody4 4,400x, pendulum4 1,652,000x = CHAOTIC**. Chaos correctly switches on with the third
+link / fourth body.
+
+### 14d. Physics audit results
+Gravity 9.81 m/s² (measured free-fall −9.765 with drag). Pendulum energy conserved to
+**0.001–0.018%** (the integrator is faithful). N-body energy drift **0.5–7.6%** after fixes.
+All worlds measured **omnidirectional** (direction concentration |R| ≈ 0.01–0.15).
+
+**Caveat that still stands:** translation invariance is *architecturally guaranteed* (positions
+fed relative); **direction is not** — the model sees absolute orientation and world-frame
+velocities, and gravity singles out −z, so all-heading generalization is *learned from data
+coverage*, not enforced. Recommended (not yet implemented): **yaw augmentation** — randomly
+rotate each training trajectory about the vertical axis.
+
+### 14e. Errors hit and how each was fixed
+| Problem | Cause | Fix |
+|---|---|---|
+| Wrong body velocities everywhere | `data.cvel` is a **com-based spatial** velocity referenced to the subtree CoM, not a body's own linear velocity | use `mj_objectVelocity(..., flg_local=0)` |
+| Spins hit **800 rad/s**, speeds 29 m/s (energy *injected*) | damping torque computed from free-joint `qvel[3:6]` (**body** frame) applied via `xfrc_applied` (**world** frame) | read + apply in world frame |
+| Ball never came to rest (rolled 12+ s, 15 m) | MuJoCo's rolling-friction term barely decelerates | explicit rolling resistance (later removed for universality; episodes now cap at `max_steps`) |
+| Rest never detected for a rolling ball | a rolling sphere spins `v/r`, so a tight spin bound is unsatisfiable | loosened `rest_spin` to 3.0; linear speed is the real criterion |
+| N-body energy drift **255%** | forces held constant across RK4's internal stages | `timestep=0.0005`, `n_substeps=16` |
+| N-body drift still 105% | close approaches → enormous forces | `SOFTENING` 0.05→0.10 + end episode at `COLLIDE_R` (they'd have collided) |
+| N-body: nothing interesting happened | `G=1` → an episode covered **less than one orbit** | `G=15` |
+| `nbody4` episodes ended after 8 steps | bodies spawned already inside the collision radius | resample/expand spawn until separations > `4*COLLIDE_R` |
+| N-body **direction bias** (\|R\|=0.60) | `np.sort()` on ring angles always gave body 0 (the target) the smallest angle | removed the sort → \|R\|=0.07 |
+| Pendulums strictly **planar** (y-spread 0.0000) | fixed hinge axis `0 1 0` | randomize the swing plane per episode |
+| Pendulum chaos suppressed | joint damping too high | damping ≤ 0.004 |
+| Pendulum entity count inflated | massless `anchor` wrapper body | chain attached directly to worldbody |
+| Leaf aero attempt: fell in 0.86 s, no flutter | pitch-moment **sign wrong** — drove the leaf edge-on where drag is 12× lower | verified sign by experiment (negative = restoring); later removed entirely |
+| Leaf aero attempt: spin-up, no flutter | centre-of-pressure offset acted as a **pinwheel** (maple-seed autorotation) | reduced, then whole model removed for universality |
+| `live.py` reported landing error of "0.5 cm" | measured at the **last frame**, when the body had already landed and only 1 step remained — trivially accurate and **misleading** | report the call after 25/50/75% watched |
+| `live.py` video frozen after generalizing | removed the per-frame pose-set; the universal 13-dim state **cannot** pose a pendulum (its `qpos` is joint angles) | store `qpos/qvel` snapshots alongside the trajectory |
+| Kaggle OOM at batch 8192/4096/3072 | **two independent** sources: encoder attention is O(L²·batch), decoder backprop is O(fut_cap·batch·dec_hidden) | gradient checkpointing (`--ckpt-chunk`), lower batch, `expandable_segments:True` |
+| Mixed-world dataset filename collisions | every world wrote `ep_00000.npy` | `--tag` prefix (defaults to world name) → many worlds share one `--out` dir |
+
+### 14f. Commands
+```bash
+# generate - all worlds into ONE folder (tagged filenames prevent collisions)
+python -m action.generate_data --world object    --episodes 2500 --out data/all --workers 8
+python -m action.generate_data --world ball      --episodes 1200 --out data/all --workers 8
+python -m action.generate_data --world leaf      --episodes 1200 --out data/all --workers 8
+python -m action.generate_data --world pendulum2 --episodes 1000 --out data/all --workers 8
+python -m action.generate_data --world pendulum3 --episodes 1000 --out data/all --workers 8
+python -m action.generate_data --world nbody3    --episodes 1000 --out data/all --workers 8
+
+# train ONE general model  (--stride raises/lowers the window count; big datasets need
+# FAR fewer epochs: ~1.46M windows at stride 3 is ~380 batches/epoch = 5-15 min/epoch)
+python -m action.train_memory --data data/all --out runs/general.pt \
+    --epochs 15 --batch 3840 --fut-cap 120 --hist-cap 160 --ckpt-chunk 24 \
+    --stride 10 --device cuda --lr 2e-3
+
+# use it
+python -m action.live --memory runs/general.pt --world object --drops 5 --show
+python -m action.live --memory runs/general.pt --world ball --drops 5 --out runs/live_ball.mp4
+python -m action.train_memory --measure runs/general.pt --data data/all
+```
+Note: training prints nothing until an **epoch completes** — a long silence after the
+`train windows ...` line is normal, not a hang.
+
+**The real test still to run:** hold out an entire world (e.g. `object_capsule`, `pendulum4`),
+train without it, and measure on it. That turns "generalizes" from a claim into a result.
+
+### 14g. Superseded
+`action/models_general.py` — a multi-entity graph/attention net (permutation-equivariant,
+verified on 1–12 bodies). Built before correction #1; kept in case true multi-body scene
+prediction is ever wanted, but it is **not** the current direction.
+
+---
+
 ## 11. Edit log (chronological, why each change)
 
 - **World + pipeline built** — leaf in ellipsoid fluid model; parallel data gen; MLP baseline;
@@ -385,6 +500,16 @@ across all worlds — the honest headline result this project has been building 
   landed and only one step remained); fixed to report the call after 25/50/75 % watched.
 - **`worlds/` package** — ball, n-link pendulum, n-body under real Newtonian gravitation;
   world-agnostic `generate_data.py --world` + `meta.json`. Measured the chaos spectrum.
+- **`entities.py` universal representation** — every object is the same 13 world-frame numbers,
+  so a new object type needs no retraining. Single-target `(T,13)` format for all worlds.
+- **UNIVERSAL PHYSICS enforced** — deleted the bespoke ball drag and leaf `_aero()` after the
+  user correctly pointed out that per-object physics makes importing a new entity impossible.
+  Added `worlds/generic.py` (`object_*`) to prove arbitrary shapes work with zero new code.
+- **Physics audit** — verified gravity, energy conservation, and omnidirectionality by
+  measurement rather than assertion; fixed the velocity-frame, energy-injection, n-body
+  integration, pendulum-planarity and n-body direction-bias bugs it exposed (see §14e).
+- **`--tag`** on data generation so many worlds share one dataset; **`--world`** on `live.py`.
+- **Full error/fix table written up in §14e.**
 ```
 Remember: report outcomes faithfully. When a prediction turns out wrong (e.g. "determinism
 will open the window"), say so plainly and explain what the measurement actually showed.
