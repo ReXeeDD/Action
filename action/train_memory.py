@@ -222,6 +222,28 @@ def _diagnostics(ckpt, data, dev="cpu"):
             print(f"  watched {int(fr*100):2d}% of fall: +0.48s err = {np.mean(es)*100:5.1f} cm",
                   flush=True)
 
+    # (3) THE honest window: how far ahead can it see, given it has watched enough?
+    # 12 frames can't identify a 1.6s sway; this seeds from later and predicts to
+    # landing, reporting the window (err<10cm) as a function of observation.
+    print("\nwindow vs how much it watched first (predict to landing):", flush=True)
+    for fr in [0.20, 0.35, 0.50]:
+        errs = []
+        for traj in ev:
+            t0 = int(fr * len(traj))
+            if t0 < 12 or len(traj) - t0 < 10:
+                continue
+            pred = mem_predict(net, hist_cap, fm, fs, dm, dsd, traj[:t0], traj[t0 - 1],
+                               len(traj) - t0, dev)
+            errs.append(np.linalg.norm(pred[:, 0:3] - traj[t0:, 0:3], axis=1))
+        if not errs:
+            continue
+        m = max(len(e) for e in errs)
+        avg = np.array([np.mean([e[i] for e in errs if len(e) > i]) for i in range(m)])
+        cross = np.where(avg > 0.10)[0]
+        win = f"{cross[0]*dt:.2f}s ~= {cross[0]*dt*1.8:.2f} m ahead" if len(cross) \
+            else f"to landing (<10cm the whole way, max {avg.max()*100:.0f}cm)"
+        print(f"  watched {int(fr*100):2d}% of fall: WINDOW = {win}", flush=True)
+
 
 def measure(args):
     print("=" * 60 + "\nKEY RESULTS\n" + "=" * 60, flush=True)
