@@ -10,6 +10,8 @@ Phases 3-4 (later, stubbed in spirit): a probabilistic head for the
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -131,11 +133,19 @@ class SeqPredictor(nn.Module):
 
     def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 64,
                  dec_hidden: int = 128, d_model: int = 64, nhead: int = 4,
-                 enc_layers: int = 2):
+                 enc_layers: int = 2, n_time_freq: int = 8):
         super().__init__()
         self.encoder = TrajContextEncoder(state_dim, d_model, nhead, enc_layers, context_dim)
         self.h0 = nn.Linear(context_dim, dec_hidden)
-        self.cell = nn.GRUCell(state_dim + context_dim, dec_hidden)
+        # Fourier time-clock: the sway force is a periodic function of the step
+        # counter, so we hand the decoder a bank of sin/cos of the elapsed rollout
+        # step. Combined with the frequency implied by z, it can lock onto the
+        # oscillation's phase instead of trying to count steps implicitly.
+        self.n_time_freq = n_time_freq
+        time_dim = 2 * n_time_freq
+        freqs = torch.exp(torch.linspace(math.log(0.05), math.log(1.2), n_time_freq))
+        self.register_buffer("time_freqs", freqs)          # (F,) angular rad/step
+        self.cell = nn.GRUCell(state_dim + context_dim + time_dim, dec_hidden)
         self.out = nn.Linear(dec_hidden, state_dim)
         self.state_dim = state_dim
         self.context_dim = context_dim
@@ -154,11 +164,14 @@ class SeqPredictor(nn.Module):
         """
         h = torch.tanh(self.h0(z))
         state = cur_state
+        B = z.size(0)
         deltas_norm, states = [], []
-        for _ in range(n_steps):
+        for j in range(n_steps):
             feat_rel = torch.cat([state[:, 0:3] - anchor_pos, state[:, 3:]], dim=-1)
             feat = (feat_rel - feat_mean) / feat_std
-            h = self.cell(torch.cat([feat, z], dim=-1), h)
+            ang = self.time_freqs * float(j)                 # (F,)
+            tf = torch.cat([torch.sin(ang), torch.cos(ang)]).unsqueeze(0).expand(B, -1)
+            h = self.cell(torch.cat([feat, z, tf], dim=-1), h)
             d_norm = self.out(h)                             # (B,13)
             deltas_norm.append(d_norm)
             delta = d_norm * delta_std + delta_mean

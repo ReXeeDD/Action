@@ -116,35 +116,45 @@ def train(args):
             hist_n = hist_n + args.noise * torch.randn_like(hist_n)
         z = net.encode(hist_n, key_padding_mask=hmask)
         n_steps = fut.size(1)
-        pred_dn, _ = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd)
+        pred_dn, states = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd)
+        denom = fvalid.sum().clamp_min(1.0)
+        # per-step delta loss (shape of the motion)
         seq = torch.cat([cur.unsqueeze(1), fut], dim=1)
         tgt_dn = ((seq[:, 1:] - seq[:, :-1]) - dm) / dsd
-        se = ((pred_dn - tgt_dn) ** 2).sum(-1)               # (B, n_steps)
-        loss = (se * fvalid).sum() / fvalid.sum().clamp_min(1.0)
+        delta_loss = (((pred_dn - tgt_dn) ** 2).sum(-1) * fvalid).sum() / denom
+        # cumulative POSITION loss (what the window actually measures, in metres)
+        pos_se = ((states[:, :, 0:3] - fut[:, :, 0:3]) ** 2).sum(-1)   # (B, n_steps) m^2
+        pos_loss = (pos_se * fvalid).sum() / denom
+        loss = delta_loss + args.pos_weight * pos_loss
         if train_mode:
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             opt.step()
-        return loss.item()
+        # select checkpoints on the position error (metres) — the metric we care about
+        return loss.item(), pos_loss.item()
 
     save = lambda: torch.save(
         {"state_dict": net.state_dict(), "hist_cap": args.hist_cap, "ctx": args.ctx,
+         "n_time_freq": net.n_time_freq,
          "feat_mean": fm.cpu().numpy(), "feat_std": fs.cpu().numpy(),
          "delta_mean": dm.cpu().numpy(), "delta_std": dsd.cpu().numpy()}, args.out)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     best = float("inf")
     for ep in range(args.epochs):
-        net.train(); tl = [run(b, True) for b in dl]
+        net.train(); tr = [run(b, True) for b in dl]
         net.eval()
         with torch.no_grad():
-            vl = [run(b, False) for b in vdl]
+            va = [run(b, False) for b in vdl]
         sched.step()
+        tr_loss = np.mean([x[0] for x in tr])
+        va_pos = np.mean([x[1] for x in va])                 # val position error (m^2)
         tag = ""
-        if np.mean(vl) < best:
-            best = np.mean(vl); save(); tag = "  <-- saved"
-        print(f"epoch {ep+1:3d}  train {np.mean(tl):.4f}  val {np.mean(vl):.4f}{tag}", flush=True)
-    print(f"best val {best:.4f}  -> {args.out}", flush=True)
+        if va_pos < best:
+            best = va_pos; save(); tag = "  <-- saved"
+        print(f"epoch {ep+1:3d}  train {tr_loss:.4f}  "
+              f"val_pos {va_pos*1e4:.1f}cm2  (rmse {np.sqrt(va_pos)*100:.1f}cm){tag}", flush=True)
+    print(f"best val_pos rmse {np.sqrt(best)*100:.1f}cm  -> {args.out}", flush=True)
 
     print("\n" + "=" * 60 + "\nKEY RESULTS (share these)\n" + "=" * 60, flush=True)
     _diagnostics(args.out, args.data, dev="cpu")
@@ -153,7 +163,7 @@ def train(args):
 # ----------------------------------------------------------------------------
 def load_mem(ckpt_path, device="cpu"):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    net = SeqPredictor(context_dim=ck["ctx"]).to(device)
+    net = SeqPredictor(context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8)).to(device)
     net.load_state_dict(ck["state_dict"]); net.eval()
     t = lambda k: torch.tensor(ck[k], device=device)
     return net, ck["hist_cap"], t("feat_mean"), t("feat_std"), t("delta_mean"), t("delta_std")
@@ -232,6 +242,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=3e-4)
     ap.add_argument("--noise", type=float, default=0.05)
+    ap.add_argument("--pos-weight", type=float, default=10.0,
+                    help="weight on the cumulative position (metre) loss")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
