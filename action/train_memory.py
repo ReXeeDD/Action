@@ -98,7 +98,7 @@ def train(args):
     tr_eps = [eps[i] for i in perm[n_val:]]
 
     tr = StreamWindows(tr_eps, args.hist_cap, args.fut_cap, stride=args.stride)
-    va = StreamWindows(val_eps, args.hist_cap, args.fut_cap, stride=args.fut_cap)
+    va = StreamWindows(val_eps, args.hist_cap, args.fut_cap, stride=20)  # denser, trustworthy val
     fm, fs, dm, dsd = (x.to(dev) for x in _fit_norms(tr))
     print(f"train windows {len(tr)}  val windows {len(va)}  "
           f"hist_cap={args.hist_cap} fut_cap={args.fut_cap} device={dev}", flush=True)
@@ -112,6 +112,8 @@ def train(args):
     def run(batch, train_mode):
         hist, cur, anchor, fut, hmask, fvalid = (t.to(dev) for t in batch)
         hist_n = (hist - fm) / fs
+        if train_mode and args.noise > 0:                    # input-noise augmentation
+            hist_n = hist_n + args.noise * torch.randn_like(hist_n)
         z = net.encode(hist_n, key_padding_mask=hmask)
         n_steps = fut.size(1)
         pred_dn, _ = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd)
@@ -228,7 +230,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--wd", type=float, default=3e-4)
+    ap.add_argument("--noise", type=float, default=0.05)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
