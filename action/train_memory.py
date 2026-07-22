@@ -103,7 +103,8 @@ def train(args):
     print(f"train windows {len(tr)}  val windows {len(va)}  "
           f"hist_cap={args.hist_cap} fut_cap={args.fut_cap} device={dev}", flush=True)
 
-    net = SeqPredictor(context_dim=args.ctx).to(dev)
+    net = SeqPredictor(context_dim=args.ctx, dec_hidden=args.dec_hidden,
+                       d_model=args.dmodel, enc_layers=args.enc_layers).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     dl = DataLoader(tr, batch_size=args.batch, shuffle=True, drop_last=True, collate_fn=collate)
@@ -135,7 +136,8 @@ def train(args):
 
     save = lambda: torch.save(
         {"state_dict": net.state_dict(), "hist_cap": args.hist_cap, "ctx": args.ctx,
-         "n_time_freq": net.n_time_freq,
+         "n_time_freq": net.n_time_freq, "dec_hidden": args.dec_hidden,
+         "dmodel": args.dmodel, "enc_layers": args.enc_layers,
          "feat_mean": fm.cpu().numpy(), "feat_std": fs.cpu().numpy(),
          "delta_mean": dm.cpu().numpy(), "delta_std": dsd.cpu().numpy()}, args.out)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +165,9 @@ def train(args):
 # ----------------------------------------------------------------------------
 def load_mem(ckpt_path, device="cpu"):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    net = SeqPredictor(context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8)).to(device)
+    net = SeqPredictor(context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8),
+                       dec_hidden=ck.get("dec_hidden", 128), d_model=ck.get("dmodel", 64),
+                       enc_layers=ck.get("enc_layers", 2)).to(device)
     net.load_state_dict(ck["state_dict"]); net.eval()
     t = lambda k: torch.tensor(ck[k], device=device)
     return net, ck["hist_cap"], t("feat_mean"), t("feat_std"), t("delta_mean"), t("delta_std")
@@ -258,7 +262,10 @@ def main():
     ap.add_argument("--hist-cap", type=int, default=160)
     ap.add_argument("--fut-cap", type=int, default=220)
     ap.add_argument("--stride", type=int, default=3)
-    ap.add_argument("--ctx", type=int, default=64)
+    ap.add_argument("--ctx", type=int, default=96)
+    ap.add_argument("--dec-hidden", type=int, default=256)
+    ap.add_argument("--dmodel", type=int, default=96)
+    ap.add_argument("--enc-layers", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)

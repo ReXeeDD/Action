@@ -96,8 +96,8 @@ class TrajContextEncoder(nn.Module):
     window could never see, and compress it into z.
     """
 
-    def __init__(self, state_dim: int = STATE_DIM, d_model: int = 64, nhead: int = 4,
-                 layers: int = 2, context_dim: int = 64, max_len: int = 256):
+    def __init__(self, state_dim: int = STATE_DIM, d_model: int = 96, nhead: int = 4,
+                 layers: int = 3, context_dim: int = 96, max_len: int = 256):
         super().__init__()
         self.inp = nn.Linear(state_dim, d_model)
         self.pos = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
@@ -105,19 +105,23 @@ class TrajContextEncoder(nn.Module):
             d_model, nhead, dim_feedforward=4 * d_model,
             batch_first=True, activation="gelu")
         self.encoder = nn.TransformerEncoder(enc_layer, layers)
+        # attention pooling: a learned query scores each frame, so the context keeps
+        # the phase-carrying frames instead of averaging them away (mean-pool did).
+        self.pool_score = nn.Linear(d_model, 1)
         self.to_ctx = nn.Linear(d_model, context_dim)
         self.context_dim = context_dim
 
     def forward(self, hist_feat, key_padding_mask=None):
         """hist_feat: (B, L, state_dim) normalized. key_padding_mask: (B, L) bool,
-        True = padded/ignore. With variable-length (streaming) histories we mask the
-        padding and mean-pool only over the real frames."""
+        True = padded/ignore. Variable-length (streaming) histories are masked out of
+        both the attention and the pooling."""
         h = self.inp(hist_feat) + self.pos[:, : hist_feat.size(1)]
         h = self.encoder(h, src_key_padding_mask=key_padding_mask)
-        if key_padding_mask is None:
-            return self.to_ctx(h.mean(dim=1))
-        valid = (~key_padding_mask).float().unsqueeze(-1)     # (B,L,1)
-        pooled = (h * valid).sum(1) / valid.sum(1).clamp_min(1.0)
+        scores = self.pool_score(h).squeeze(-1)               # (B, L)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask, float("-inf"))
+        w = torch.softmax(scores, dim=1).unsqueeze(-1)        # (B, L, 1)
+        pooled = (h * w).sum(dim=1)                           # (B, d_model)
         return self.to_ctx(pooled)                            # (B, context_dim)
 
 
@@ -131,9 +135,9 @@ class SeqPredictor(nn.Module):
     about the environment, and the rollout is trained to stay stable.
     """
 
-    def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 64,
-                 dec_hidden: int = 128, d_model: int = 64, nhead: int = 4,
-                 enc_layers: int = 2, n_time_freq: int = 12):
+    def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 96,
+                 dec_hidden: int = 256, d_model: int = 96, nhead: int = 4,
+                 enc_layers: int = 3, n_time_freq: int = 12):
         super().__init__()
         self.encoder = TrajContextEncoder(state_dim, d_model, nhead, enc_layers, context_dim)
         self.h0 = nn.Linear(context_dim, dec_hidden)
