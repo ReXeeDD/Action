@@ -133,7 +133,7 @@ class SeqPredictor(nn.Module):
 
     def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 64,
                  dec_hidden: int = 128, d_model: int = 64, nhead: int = 4,
-                 enc_layers: int = 2, n_time_freq: int = 8):
+                 enc_layers: int = 2, n_time_freq: int = 12):
         super().__init__()
         self.encoder = TrajContextEncoder(state_dim, d_model, nhead, enc_layers, context_dim)
         self.h0 = nn.Linear(context_dim, dec_hidden)
@@ -141,9 +141,13 @@ class SeqPredictor(nn.Module):
         # counter, so we hand the decoder a bank of sin/cos of the elapsed rollout
         # step. Combined with the frequency implied by z, it can lock onto the
         # oscillation's phase instead of trying to count steps implicitly.
+        # The band is matched to the leaf's ACTUAL forcing: leaf_world drives sway
+        # at angular freqs f*{0.7..2.7} with f in [0.025,0.045] -> ~0.017..0.12
+        # rad/step. We span 0.008..0.25 to cover the fundamental + harmonics with
+        # margin (the old 0.05..1.2 band was tuned to the wrong frequencies).
         self.n_time_freq = n_time_freq
         time_dim = 2 * n_time_freq
-        freqs = torch.exp(torch.linspace(math.log(0.05), math.log(1.2), n_time_freq))
+        freqs = torch.exp(torch.linspace(math.log(0.008), math.log(0.25), n_time_freq))
         self.register_buffer("time_freqs", freqs)          # (F,) angular rad/step
         self.cell = nn.GRUCell(state_dim + context_dim + time_dim, dec_hidden)
         self.out = nn.Linear(dec_hidden, state_dim)
