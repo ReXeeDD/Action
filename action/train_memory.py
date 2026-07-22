@@ -117,7 +117,8 @@ def train(args):
             hist_n = hist_n + args.noise * torch.randn_like(hist_n)
         z = net.encode(hist_n, key_padding_mask=hmask)
         n_steps = fut.size(1)
-        pred_dn, states = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd)
+        pred_dn, states = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd,
+                                     ckpt_chunk=args.ckpt_chunk)
         denom = fvalid.sum().clamp_min(1.0)
         # per-step delta loss (shape of the motion)
         seq = torch.cat([cur.unsqueeze(1), fut], dim=1)
@@ -266,6 +267,9 @@ def main():
     ap.add_argument("--dec-hidden", type=int, default=256)
     ap.add_argument("--dmodel", type=int, default=96)
     ap.add_argument("--enc-layers", type=int, default=3)
+    ap.add_argument("--ckpt-chunk", type=int, default=24,
+                    help="gradient-checkpoint the rollout in chunks of this many steps "
+                         "(0 = off); lets the big model train at a big batch")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)

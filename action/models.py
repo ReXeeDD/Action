@@ -162,32 +162,58 @@ class SeqPredictor(nn.Module):
     def encode(self, hist_feat, key_padding_mask=None):
         return self.encoder(hist_feat, key_padding_mask)
 
-    def decode(self, z, cur_state, anchor_pos, n_steps,
-               feat_mean, feat_std, delta_mean, delta_std, quat_norm: bool = True):
-        """Differentiable autoregressive rollout in absolute state space.
-
-        z:(B,C)  cur_state:(B,13) absolute  anchor_pos:(B,3)
-        feat_*/delta_*: (13,) normalization tensors. Returns predicted NORMALIZED
-        deltas (B, n_steps, 13); also returns the absolute states it passed through.
-        """
-        h = torch.tanh(self.h0(z))
-        state = cur_state
+    def _run_steps(self, h, state, z, start, count, anchor_pos,
+                   feat_mean, feat_std, delta_mean, delta_std, quat_norm):
+        """Roll `count` autoregressive steps starting at step index `start`.
+        Returns (h, state, chunk_deltas_norm (B,count,13), chunk_states (B,count,13))."""
         B = z.size(0)
-        deltas_norm, states = [], []
-        for j in range(n_steps):
+        dn_list, st_list = [], []
+        for j in range(start, start + count):
             feat_rel = torch.cat([state[:, 0:3] - anchor_pos, state[:, 3:]], dim=-1)
             feat = (feat_rel - feat_mean) / feat_std
             ang = self.time_freqs * float(j)                 # (F,)
             tf = torch.cat([torch.sin(ang), torch.cos(ang)]).unsqueeze(0).expand(B, -1)
             h = self.cell(torch.cat([feat, z, tf], dim=-1), h)
             d_norm = self.out(h)                             # (B,13)
-            deltas_norm.append(d_norm)
             delta = d_norm * delta_std + delta_mean
             state = state + delta
             if quat_norm:
                 q = state[:, 3:7]
                 q = q / q.norm(dim=1, keepdim=True).clamp_min(1e-8)
                 state = torch.cat([state[:, 0:3], q, state[:, 7:]], dim=-1)
-            states.append(state)
-        return torch.stack(deltas_norm, dim=1), torch.stack(states, dim=1)
+            dn_list.append(d_norm)
+            st_list.append(state)
+        return h, state, torch.stack(dn_list, dim=1), torch.stack(st_list, dim=1)
+
+    def decode(self, z, cur_state, anchor_pos, n_steps,
+               feat_mean, feat_std, delta_mean, delta_std, quat_norm: bool = True,
+               ckpt_chunk: int = 0):
+        """Differentiable autoregressive rollout in absolute state space.
+
+        z:(B,C)  cur_state:(B,13) absolute  anchor_pos:(B,3)
+        feat_*/delta_*: (13,) normalization tensors. Returns predicted NORMALIZED
+        deltas (B, n_steps, 13); also the absolute states it passed through.
+
+        ckpt_chunk>0 enables gradient checkpointing: the rollout is run in chunks of
+        that many steps whose activations are recomputed in backward instead of
+        stored — cutting rollout memory ~chunk-fold for ~30% more compute, so the big
+        model can train at a big batch. Off (0) by default and during eval.
+        """
+        h = torch.tanh(self.h0(z))
+        state = cur_state
+        if not (ckpt_chunk and self.training):
+            _, _, dn, st = self._run_steps(h, state, z, 0, n_steps, anchor_pos,
+                                           feat_mean, feat_std, delta_mean, delta_std, quat_norm)
+            return dn, st
+        import torch.utils.checkpoint as cp
+        dn_all, st_all, j = [], [], 0
+        while j < n_steps:
+            c = min(ckpt_chunk, n_steps - j)
+            h, state, dn_c, st_c = cp.checkpoint(
+                self._run_steps, h, state, z, j, c, anchor_pos,
+                feat_mean, feat_std, delta_mean, delta_std, quat_norm,
+                use_reentrant=False)
+            dn_all.append(dn_c); st_all.append(st_c)
+            j += c
+        return torch.cat(dn_all, dim=1), torch.cat(st_all, dim=1)
 
