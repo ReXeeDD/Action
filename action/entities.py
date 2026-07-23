@@ -123,6 +123,59 @@ def scene_centroid(state: np.ndarray) -> np.ndarray:
     return state[..., 0:3].mean(axis=-2)
 
 
+def yaw_rotate(states, theta):
+    """Rotate whole states about the WORLD VERTICAL axis by `theta`.
+
+    Gravity singles out -z, so the physics of every world here is *exactly* invariant
+    to rotation about the vertical axis: spin the entire scene about z and the same
+    trajectory results, merely rotated. The model does not know that — it sees absolute
+    quaternions and world-frame velocities, and only copes with all headings because
+    the data happens to cover them. Applying a random yaw to each training window
+    turns that hope into free, exactly-correct extra data.
+
+    Rotation is about the ORIGIN, not about the object. That matters: a pendulum's
+    pivot sits at the origin and the symmetry only holds about *that* axis. For the
+    free-body worlds the ground plane is infinite and axisymmetric, so origin-centred
+    yaw is equally valid there.
+
+    Works for numpy arrays and torch tensors. `states` is (..., 13); `theta` is a
+    scalar or broadcasts against the leading dims.
+    """
+    # NOTE: test for numpy explicitly. `hasattr(states, "device")` is NOT a valid way
+    # to detect a torch tensor — numpy 2.x arrays carry a `.device` attribute too
+    # (array-API standard), so that check silently sends numpy down the torch path.
+    is_torch = not isinstance(states, np.ndarray)
+    if is_torch:
+        import torch
+        cos, sin, stack = torch.cos, torch.sin, torch.stack
+        theta = torch.as_tensor(theta, device=states.device, dtype=states.dtype)
+    else:
+        cos, sin = np.cos, np.sin
+        stack = lambda xs, axis=-1: np.stack(xs, axis=axis)
+        theta = np.asarray(theta, dtype=states.dtype)
+
+    c, s = cos(theta), sin(theta)
+    ch, sh = cos(theta / 2), sin(theta / 2)          # half-angle, for the quaternion
+
+    def rot(v):                                       # Rz applied to a 3-vector
+        x, y, z = v[..., 0], v[..., 1], v[..., 2]
+        return stack([c * x - s * y, s * x + c * y, z], -1)
+
+    pos, quat = rot(states[..., 0:3]), states[..., 3:7]
+    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    # q' = q_yaw (x) q  with q_yaw = (cos(t/2), 0, 0, sin(t/2)), MuJoCo's (w,x,y,z)
+    # order. LEFT multiplication = rotate the orientation in the WORLD frame, which is
+    # what rotating the scene means. Right-multiplying instead would rotate about the
+    # body's own axis and silently corrupt the orientation while still looking plausible.
+    quat = stack([ch * w - sh * z, ch * x - sh * y,
+                  ch * y + sh * x, ch * z + sh * w], -1)
+    # angular velocity is a pseudovector, but Rz is a proper rotation (det = +1),
+    # so it transforms with the same matrix as a true vector.
+    lin, ang = rot(states[..., 7:10]), rot(states[..., 10:13])
+    cat = (__import__("torch").cat if is_torch else np.concatenate)
+    return cat([pos, quat, lin, ang], -1)
+
+
 def normalize_quats(states: np.ndarray) -> np.ndarray:
     """Renormalize every entity's quaternion (rollouts drift off the unit sphere)."""
     out = states.copy()

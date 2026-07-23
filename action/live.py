@@ -72,11 +72,21 @@ def one_drop(mem, rng, cam="wide", W=900, H=640, n_ahead=260, stride=2, min_watc
     """Simulate one fresh episode of ANY world, predicting live."""
     world = make_world(world_name, seed=int(rng.integers(0, 2**31 - 1)))
     world.reset(randomize=True)
-    # If this object has a free root (leaf, ball, generic object) release it from a
-    # random spot at a random height. Pendulums and n-body have no free root, so we
-    # leave their own randomized initial condition alone.
+    # If this world is a SINGLE free body (leaf, ball, generic object) release it from
+    # a random spot at a random height. Multi-body worlds have a configured initial
+    # arrangement — a pendulum chain, an n-body ring balanced for orbits — that must
+    # not be disturbed.
+    #
+    # The test used to be `model.nq >= 7`, meaning "has a free joint". That silently
+    # broke n-body: each mass is THREE SLIDE JOINTS, so nbody3 has nq=9 and nbody4
+    # nq=12, both of which pass. Body 0 was teleported to a random point 2.2-3.8 m up
+    # while keeping the orbital velocity computed for its original ring position, so
+    # it left on a near-straight line and never visibly interacted with anything.
+    # (nbody2, with nq=6, happened to escape this.) Counting bodies is the correct
+    # test and works for every world.
+    from action.entities import n_entities
     x0, y0, h0 = 0.0, 0.0, 0.0
-    if world.model.nq >= 7:
+    if world.model.nq >= 7 and n_entities(world.model) == 1:
         x0, y0 = rng.uniform(-spread, spread, size=2)
         h0 = rng.uniform(h_lo, h_hi)
         world.data.qpos[0:3] = [x0, y0, h0]

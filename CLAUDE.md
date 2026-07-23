@@ -434,6 +434,11 @@ rotate each training trajectory about the vertical axis.
 | Training slow (150 s/epoch) | 240 *sequential* GRU steps per batch — sequential depth, not arithmetic | flow-map decoder, all horizons in parallel → 50 s/epoch (§15e) |
 | `predict()` silently corrupted the caller's trajectory | `torch.from_numpy` shares memory and `.to("cpu")` is a no-op, so the in-place anchor subtraction wrote through | `.clone()` |
 | `_diagnostics` crashed on any dataset < 1400 episodes | hardcoded `eps[1400:1470]` → empty slice | use the tail, `eps[-70:]` |
+| **Mutual gravitation never applied — n-body was empty space** | `apply_forces` defined **twice** in `MujocoWorld`; the later empty stub overrode the real Newtonian law | delete the stub (§16a). Tell was `const-v` baseline error of exactly 0.00 cm |
+| N-body systems flew apart once gravity worked | launch speed used `sqrt(G·M_total/r)` — a **ring** treated as a point mass, overestimating v_circ by 2.0–2.8× and exceeding escape velocity | ring formula `sqrt(G·m·S_n/R)` (§16b) |
+| `live.py` teleported the n-body target out of its orbit | free-body test was `model.nq >= 7`, but each n-body mass is **3 slide joints** so `nbody3` (nq=9) passed | test `n_entities(model) == 1` (§16c) |
+| Kaggle OOM at epoch 4 after 3 healthy epochs | the curriculum grows the horizon each epoch and the flow-map decoder's activations are `B×H×hidden`, so a batch that fits at H=84 dies at H=240 | memory probe at full horizon before training starts |
+| Training ran at ~2% of the T4's peak (1030 s/epoch) | `torch.cuda.is_bf16_supported()` returns **True on a T4** because it counts software emulation, but sm_75 has no bf16 tensor cores | require compute capability ≥ 8 for bf16, else fp16. Measured fp16 28.8 s vs fp32 143 s |
 
 ### 14f. Commands
 ```bash
@@ -598,6 +603,229 @@ chunk (`--pred-batch`), with `--device cuda`. A 446-frame pendulum video renders
 `LoadedMemory` (in `train_memory.py`) replaced the old 6-tuple `load_mem` return, wrapping
 both architectures behind one `predict` / `predict_batch` API so callers never branch on
 `arch`. Old `gru` checkpoints still load (`arch` defaults to `"gru"` when absent).
+
+---
+
+## 16. "Is the n-body world correct?" — no, it was empty space
+
+The user watched an `nbody3` video and asked why the target never changed direction when
+another body came near. It never did. **Mutual gravitation had never been applied at all**,
+and two further bugs sat underneath it.
+
+### 16a. BUG 1 — `apply_forces` was defined twice
+`worlds/base.py` declared `apply_forces` at line 61 with the real Newtonian law, then
+again at line 96 as an empty "subclass hook" stub. Python keeps the **last** definition,
+so the stub silently overrode the physics. Every n-body world was point masses drifting
+in straight lines at constant velocity in a vacuum.
+
+Measured `|a_measured − a_Newton| / |a_Newton|`: **99.99%** before, **0.04%** after.
+
+**The evidence had been sitting in the diagnostics the whole time and was misread:**
+`nbody3`'s `const-v` baseline error was exactly **0.00 cm at every horizon**. That can
+only happen if nothing is accelerating. It was read as "the model is excellent" when it
+meant "the world is empty". A baseline that is *perfect* is a bug report, not a triumph.
+
+Consequences: all n-body training data was straight-line drift; `general3.pt`'s +0.97
+skill on `nbody3` was the trivial achievement of predicting a straight line; and the §14c
+chaos numbers for the n-body family were measured on a world with no gravity, so they are
+void. **All n-body data must be regenerated.**
+
+### 16b. BUG 2 — the launch speed treated a ring as a point mass
+`init_state` used `v = f · sqrt(G·M_total/r)`, i.e. all the mass concentrated at the
+origin. For a regular n-gon of mass `m` at radius `R` the net inward force is
+`F = (G m²/R²)·S_n` with `S_n = ¼ Σ_{k=1}^{n-1} 1/sin(πk/n)`, so the true circular speed
+is `sqrt(G·m·S_n/R)`. The old formula overestimates it by `sqrt(n/S_n)`:
+
+| n | S_n | overestimate | code's f at which bodies ESCAPE |
+|---|---|---|---|
+| 2 | 0.250 | 2.83× | 0.50 |
+| 3 | 0.577 | 2.28× | 0.62 |
+| 4 | 0.957 | 2.04× | 0.69 |
+
+The band was `f ∈ [0.45, 0.75]`, which spans 1.03× circular (fine) to **1.71× = above
+escape velocity**. Once gravity actually worked, the systems flew apart. Widening the
+spawn ring could never have fixed this — it is a units error, not a geometry one. Fixed
+by using the ring formula, with `speed_frac` now meaning what it says (1.0 = circular).
+
+### 16c. BUG 3 — `live.py` teleported the target out of its own orbit
+`live.py` re-released the object from a random drop point whenever `model.nq >= 7`,
+intending "has a free joint". But each n-body mass is **three slide joints**, so `nbody3`
+has `nq=9` and `nbody4` `nq=12` — both passed. Body 0 was teleported 2.2–3.8 m up while
+keeping the orbital velocity computed for its original ring position, so it left on a
+near-straight line. (`nbody2`, `nq=6`, happened to escape this.) Correct test: count
+bodies — reposition only when `n_entities(model) == 1`.
+
+### 16d. Where the n-body worlds stand now
+After all three fixes, with `spawn_r=(2.2,4.0)`, `speed_frac=(0.90,1.05)`, `collide_r=0.12`:
+
+| world | frames | ran out | escaped | collided | \|dE/E\| | heading change |
+|---|---|---|---|---|---|---|
+| nbody2 | 611 (4.9 s) | 67% | 0% | 33% | 8.1% | 90° |
+| nbody3 | 305 (2.4 s) | 23% | 0% | 77% | 11.2% | 83° |
+| nbody4 | 189 (1.5 s) | 13% | 0% | 87% | 7.4% | 50° |
+| nbody5 | 140 (1.1 s) | 7% | 3% | 90% | 6.7% | 66° |
+
+Escapes are gone and the target now turns 50–90° per episode — the deflection the user
+correctly noticed was missing. Episodes end mostly by **collision**, and that is honest
+physics rather than a remaining bug: the bodies are ~0.10 m in radius, so they would
+physically touch at 0.20 m separation while we generously allow 0.12. An equal-mass
+n-body system is *violently* unstable — that is precisely why the three-body problem is
+famous. Separation growth is only 1–5× because the episodes are too short for chaos to
+develop, so the §14c chaos figures cannot be re-established from this configuration.
+
+**Open design choice:** for long-lived chaotic orbits, a *hierarchical* configuration (one
+dominant central mass plus lighter orbiters, i.e. a solar system) survives full-length
+episodes and shows clean perturbations. That changes the world's character away from "the
+three-body problem" and has not been done.
+
+---
+
+## 17. "Is the world purely random?" — audited (`action/audit_randomness.py`)
+
+The user asked whether the world is *purely random for the model to learn*. Two very
+different questions hide in that, and both are now measured rather than assumed.
+
+**1. Randomness INSIDE an episode — the unlearnable kind.** None. Every world is
+byte-identical under the same seed and differs under a different seed. This is the wall
+that ruined the original leaf (§6c): a per-step `rng.normal` made the future
+information-theoretically unpredictable. It is gone everywhere.
+
+**2. Randomness ACROSS episodes — the good kind.** Broad and unbiased. Heading
+concentration `|R|` runs 0.006–0.273 across all eight worlds (uniform sampling at n=40
+gives ~0.16 by chance), and the closest episode pair is nowhere near a duplicate. All the
+randomness lives in hidden constants drawn once per episode and then held fixed — exactly
+what the memory model is supposed to infer by watching.
+
+**3. Is the environment identifiable by watching?** This is the project's whole premise,
+so it is worth a number. Correlating "how different two episodes look in their first
+0.48 s" against "how different their futures are":
+
+| world | corr(early, late) |
+|---|---|
+| ball | 0.768 |
+| nbody2 | 0.706 |
+| leaf | 0.678 |
+| object / nbody3 | 0.608 / 0.606 |
+| pendulum1 | 0.590 |
+| pendulum2 | 0.434 |
+| **pendulum3** | **0.323** |
+
+The fingerprint is real, and it **decays exactly in order of measured chaos** — chaos is
+precisely what severs the link between early and late motion. Independent confirmation of
+the horizon story from a completely different measurement.
+
+## 18. Yaw augmentation (§0.2 of IMPROVEMENT.md) — `entities.yaw_rotate`
+
+Gravity singles out −z, so the physics is exactly invariant to rotation about the vertical
+axis. The model could never know this (it sees absolute quaternions and world-frame
+velocities), so the symmetry is now handed to it as free training data: a random yaw per
+window, applied consistently to history, current state, anchor and future.
+
+**Verified against MuJoCo, not just asserted.** Re-simulating a yaw-rotated *initial
+condition* and comparing to the rotated original trajectory:
+
+| world | step 1 | step 40 | step 250 | reading |
+|---|---|---|---|---|
+| ball | 1.3e-07 | 8.2e-08 | 7.3e-09 | exact, forever |
+| object | 1.3e-08 | 1.1e-08 | 4.2e-01 | exact until a **contact** |
+| leaf | 3.1e-05 | 9.1e-02 | 7.8e-01 | asymmetric from step 1 |
+
+Two things this caught that assertion would have missed:
+
+* **`object` is not numerically symmetric at contacts.** The transform is right (1e-08 for
+  40 steps) but MuJoCo's contact solver is not bit-symmetric under rotation, and a
+  1e-8 difference amplifies through a bounce. A perturbation control (`eps=1e-7`) stays
+  flat, so this is solver numerics, not chaos. The *physics* is symmetric.
+* **The leaf is genuinely not yaw-symmetric** — its wind is a fixed world-frame vector.
+  Augmentation is still valid, but for a subtler reason: wind is drawn as
+  `rng.normal(0, 0.7, size=3)`, **isotropic in x/y**, so a rotated leaf trajectory is
+  exactly what a rotated wind would have produced, at identical probability density. The
+  augmentation preserves the data *distribution*, which is what actually matters.
+
+Implementation notes worth keeping: rotation is about the **origin**, not the object — a
+pendulum's pivot is at the origin and the symmetry only holds about that axis. The
+quaternion is **left**-multiplied by `q_yaw` (world-frame rotation); right-multiplying
+rotates about the body's own axis and corrupts orientation while still looking plausible.
+Angular velocity is a pseudovector but `Rz` is a proper rotation (det=+1), so it transforms
+like an ordinary vector. Also: detect torch with `isinstance(x, np.ndarray)`, **not**
+`hasattr(x, "device")` — numpy 2.x arrays carry a `.device` attribute and silently take
+the torch branch.
+
+### 18a. It NaN'd immediately — and why that was a normalizer bug
+Turning augmentation on produced `nan` from epoch 1. A pendulum hinges about a
+*horizontal* axis, so its quaternion-z and angular-velocity-z are **exactly zero in every
+frame**; their fitted std is 0, clamped to `1e-6`. Un-augmented that is harmless because
+the numerator is zero too (`0/1e-6 = 0`). Yaw-rotate and quaternion-z becomes nonzero, so
+the same feature normalizes to **~5e5**, overflows bf16, and poisons every loss.
+
+Root cause: the normalizer was fit on **un-augmented** data while the model trained on
+**augmented** data. `_fit_norms` now takes `yaw_aug` and it must match training.
+Measured fix: `feat_std[6]` 0.0 → 0.346, normalized input 9.99e5 → 5.2, loss 803362 → 11.98.
+
+### 18b. VERDICT: no gain — augmentation is OFF by default
+Same seed, same data, 6 epochs, only the flag changed:
+
+| epoch | yaw OFF | yaw ON |
+|---|---|---|
+| 3 | 22.5 cm | 23.0 cm |
+| 5 | 18.9 cm | 20.2 cm |
+| 6 | **17.0 cm** | 17.9 cm |
+
+No benefit, and slower convergence (train loss 5.50 vs 6.55). **The audit in §17 already
+predicted this and the connection was missed:** every world *already* samples heading
+isotropically (|R| = 0.006–0.273 — pendulums randomize their swing plane per episode,
+ball/object launch in random directions). There is no directional gap to fill, so the
+"free extra data" IMPROVEMENT.md §0.2 promised does not exist here. The flag is kept
+because it would matter for a world whose data does *not* cover all headings — but for
+these worlds it is redundant variety.
+
+Two lessons: an ablation caught a change that would otherwise have burned an hour of
+cloud time on `nan`; and a measurement we already had (§17) contained the answer before
+the experiment was run.
+
+---
+
+## 19. The cone — probabilistic prediction (§1.1 of IMPROVEMENT.md)
+
+`pendulum3` sat at skill exactly +0.32 at 1.92 s through two rounds of major improvement
+while every other world moved. Past a positive-Lyapunov horizon a single trajectory is
+**provably** wrong; only a distribution is honest. This is the correctness gap.
+
+### 19a. The design decision is the SHAPE of the noise, not the loss
+A probabilistic head that draws fresh noise at every horizon gives samples that jitter —
+paths no physical object could follow. That is not a cone, it is static.
+
+What this model is uncertain about is **the environment it inferred by watching**: a set
+of constants held fixed for the episode. Uncertainty in a *constant* propagates forward
+coherently. So `sample_futures` draws **one** standard normal per sample and holds it
+fixed across the whole horizon, scaling by the predicted per-horizon sigma. Every sample
+is a smooth trajectory diverging steadily from the mean — which is both what a cone should
+look like and what the physics implies. `mode="independent"` is kept as the contrast.
+
+### 19b. Pieces
+* `DirectTrajPredictor(probabilistic=True)` — head emits mean **and** log-sigma per
+  horizon per dimension, clamped to [−7, 3], zero-initialised (starts at "no motion,
+  sigma = 1" in normalized units).
+* **Gaussian NLL** *alongside* the scale-normalized position term. The NLL is what makes
+  the spread mean something — widen where genuinely uncertain, pay for widening where not.
+  The squared-error term stays because pure NLL can buy a better likelihood by inflating
+  sigma instead of sharpening mu.
+* `LoadedMemory.predict_dist` (mean + sigma) and `sample_futures` (the cone), with the
+  physical guard from the old ensemble cone: a sample that reaches the ground freezes
+  there instead of sinking through the floor.
+
+### 19c. Verification is CALIBRATION, not accuracy (`action/cone_eval.py`)
+A model that says "somewhere within 10 m" is never wrong and never useful; one that says
+"within 2 cm" and is right 40% of the time is confidently lying. Reported per world, per
+horizon: **coverage** at 50%/90% (must match nominal at *every* horizon; below = the
+dangerous overconfident failure), **sharpness** (median band width — either number alone
+is gameable), and **CRPS**, a proper scoring rule that cannot be gamed by inflating or
+shrinking the spread.
+
+The table ends with the question that actually matters: *does the cone know which worlds
+are predictable?* The band on `pendulum3` (679,000×) must fan out far more than on
+`pendulum1` (integrable). Equal growth would mean the model learned an average
+uncertainty rather than the physics of predictability.
 
 ---
 

@@ -54,6 +54,16 @@ class NBodyWorld(MujocoWorld):
     grav_const = G_CONST        # universal mutual gravitation (base class)
     softening = SOFTENING
 
+    # Spawn geometry, exposed so it can be tuned by measurement rather than guesswork.
+    # These had never been exercised against real orbital motion: mutual gravitation
+    # was silently disabled by a duplicate `apply_forces` in base.py, so every
+    # "calibration" of these numbers was performed on bodies drifting in straight
+    # lines. spawn_r is the ring radius range, speed_frac the launch speed as a
+    # fraction of the local circular speed (1.0 = circular, <1 falls inward).
+    spawn_r = (2.2, 4.0)
+    speed_frac = (0.90, 1.05)   # 1.0 = circular; escape is sqrt(2)
+    collide_r = 0.12            # just above SOFTENING, so the force is still smooth
+
     def __init__(self, n_bodies: int = 3, seed: int | None = None):
         super().__init__(seed)
         self.n = int(n_bodies)
@@ -96,19 +106,31 @@ class NBodyWorld(MujocoWorld):
         if randomize:
             # place bodies on a jittered ring and give them tangential velocities,
             # which tends to produce bound, interesting orbits rather than instant escape
-            R = self.rng.uniform(1.0, 2.6)
+            R = self.rng.uniform(*self.spawn_r)
             # NOTE: do NOT sort these angles. Sorting always handed body 0 (the
             # prediction target) the smallest angle, which systematically biased its
             # direction of motion and would have taught the model a preferred heading.
             ang = self.rng.uniform(0, 2 * np.pi, size=n)
             pos = np.zeros((n, 3))
             vel = np.zeros((n, 3))
+            # Circular speed for a RING of masses, not for a point mass at the centre.
+            # For a regular n-gon of mass m at radius R the net inward force is
+            #   F = (G m^2 / R^2) * S_n,   S_n = (1/4) sum_{k=1..n-1} 1/sin(pi k/n)
+            # giving v_circ = sqrt(G m S_n / R). The old code used
+            # sqrt(G * M_total / R), i.e. all the mass concentrated at the origin,
+            # which overestimates v_circ by sqrt(n/S_n) — 2.83x at n=2, 2.28x at n=3.
+            # Escape is only sqrt(2) x circular, so a "0.75 of circular" launch was
+            # really 1.7x circular and the system simply flew apart. Nobody noticed
+            # because mutual gravitation was disabled entirely (duplicate
+            # `apply_forces` in base.py), so nothing ever orbited to begin with.
+            S_n = 0.25 * sum(1.0 / np.sin(np.pi * k / n) for k in range(1, n))
+            m_avg = self.M.sum() / n
             for i in range(n):
                 r = R * self.rng.uniform(0.7, 1.3)
                 pos[i] = [r * np.cos(ang[i]), r * np.sin(ang[i]),
-                          self.rng.normal(0, 0.25)]
-                speed = np.sqrt(G_CONST * self.M.sum() / max(r, 0.3)) * \
-                    self.rng.uniform(0.45, 0.75)
+                          self.rng.normal(0, 0.25 * R / 2.0)]
+                v_circ = np.sqrt(G_CONST * m_avg * S_n / max(r, 0.3))
+                speed = v_circ * self.rng.uniform(*self.speed_frac)
                 vel[i] = [-speed * np.sin(ang[i]), speed * np.cos(ang[i]),
                           self.rng.normal(0, 0.05)]
         else:
@@ -123,7 +145,7 @@ class NBodyWorld(MujocoWorld):
             ok = True
             for i in range(n):
                 for j in range(i + 1, n):
-                    if np.linalg.norm(pos[i] - pos[j]) < 4 * COLLIDE_R:
+                    if np.linalg.norm(pos[i] - pos[j]) < 4 * self.collide_r:
                         ok = False
             if ok:
                 break
@@ -141,6 +163,6 @@ class NBodyWorld(MujocoWorld):
             return True
         for i in range(self.n):                             # a pair collided
             for j in range(i + 1, self.n):
-                if np.linalg.norm(p[i] - p[j]) < COLLIDE_R:
+                if np.linalg.norm(p[i] - p[j]) < self.collide_r:
                     return True
         return False

@@ -93,8 +93,14 @@ class MujocoWorld:
         """Set qpos/qvel for the start of the episode."""
         raise NotImplementedError
 
-    def apply_forces(self) -> None:
-        """Optional per-step forces (e.g. mutual gravitation in the N-body world)."""
+    # NOTE: do NOT re-declare `apply_forces` here as a subclass hook. It is already
+    # defined above with the real Newtonian mutual-gravitation law, and a second
+    # definition in the same class body silently OVERRIDES the first — Python keeps
+    # the last one. That stub existed here and disabled gravitation entirely: every
+    # n-body world became point masses drifting in straight lines at constant
+    # velocity. The tell was in plain sight in the diagnostics — nbody's const-v
+    # baseline error was exactly 0.00 cm at every horizon, which only happens if
+    # nothing is accelerating.
 
     @property
     def done(self) -> bool:

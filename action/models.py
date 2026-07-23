@@ -263,13 +263,16 @@ class DirectTrajPredictor(nn.Module):
     infer the environment" half is unchanged; only the rollout is replaced.
     """
 
+    LOGSTD_MIN, LOGSTD_MAX = -7.0, 3.0
+
     def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 96,
                  hidden: int = 512, blocks: int = 4, d_model: int = 96, nhead: int = 4,
                  enc_layers: int = 3, n_phys_freq: int = 12, n_oct_freq: int = 10,
-                 max_horizon: int = 320):
+                 max_horizon: int = 320, probabilistic: bool = False):
         super().__init__()
         self.encoder = TrajContextEncoder(state_dim, d_model, nhead, enc_layers, context_dim)
         self.max_horizon = max_horizon
+        self.probabilistic = probabilistic
         # Two complementary time bases, because horizon has two kinds of structure:
         #  * physical band  — the same 0.008..0.25 rad/step band the GRU clock used,
         #    matched to the leaf's sway and the pendulums' swing, so OSCILLATION is
@@ -286,8 +289,11 @@ class DirectTrajPredictor(nn.Module):
         self.inp = nn.Linear(context_dim + state_dim + time_dim, hidden)
         self.blocks = nn.ModuleList([_ResBlock(hidden) for _ in range(blocks)])
         self.norm = nn.LayerNorm(hidden)
-        self.out = nn.Linear(hidden, state_dim)
-        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)  # start at "no motion"
+        # Probabilistic mode emits mean AND log-std per horizon per dimension.
+        self.out = nn.Linear(hidden, state_dim * (2 if probabilistic else 1))
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+        # -> mean starts at "no motion"; log_std starts at 0, i.e. sigma = 1 in
+        #    normalized-displacement units, which is O(1) by construction of hstd.
         self.state_dim, self.context_dim = state_dim, context_dim
 
     def encode(self, hist_feat, key_padding_mask=None):
@@ -324,7 +330,12 @@ class DirectTrajPredictor(nn.Module):
         h = self.inp(x)
         for blk in self.blocks:
             h = blk(h)
-        disp_n = self.out(self.norm(h))                                # (B,T,13)
+        raw = self.out(self.norm(h))                                   # (B,T,13 or 26)
+        if self.probabilistic:
+            disp_n, log_std_n = raw.chunk(2, dim=-1)
+            log_std_n = torch.clamp(log_std_n, self.LOGSTD_MIN, self.LOGSTD_MAX)
+        else:
+            disp_n, log_std_n = raw, None
 
         # horizons past the fitted table reuse the last scale (mild extrapolation)
         idx = torch.clamp(torch.arange(n_steps, device=dev), max=horizon_std.size(0) - 1)
@@ -334,5 +345,5 @@ class DirectTrajPredictor(nn.Module):
             q = states[..., 3:7]
             q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
             states = torch.cat([states[..., 0:3], q, states[..., 7:]], dim=-1)
-        return disp_n, states
+        return disp_n, states, log_std_n
 

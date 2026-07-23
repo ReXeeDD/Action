@@ -45,6 +45,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from action.dataset import load_episodes, load_episodes_tagged
+from action.entities import yaw_rotate
 from action.models import SeqPredictor, DirectTrajPredictor
 
 DT = 0.008
@@ -99,19 +100,33 @@ def collate(batch):
             fut_pad, hist_mask, fut_valid, torch.tensor(wids, dtype=torch.long))
 
 
-def _fit_norms(ds, fut_cap, n=6000):
+def _fit_norms(ds, fut_cap, n=6000, yaw_aug=False):
     """Feature/delta normalizers plus the per-horizon displacement scale table.
 
     `horizon_std[k]` is the typical size of the displacement k steps ahead. The
     flow-map decoder predicts displacement in units of it, so its output stays O(1)
     whether it is asked for 1 step or 240 — without that, the same head would have to
-    emit millimetres and metres from the same weights."""
-    idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
+    emit millimetres and metres from the same weights.
+
+    `yaw_aug` MUST match training. The statistics have to describe the distribution the
+    model actually sees, and augmentation changes it in a way that is easy to miss: a
+    pendulum hinges about a horizontal axis, so its quaternion-z and angular-velocity-z
+    are *exactly* zero in every frame and their fitted std is 0 (clamped to 1e-6).
+    Un-augmented that is harmless — the numerator is zero too, so 0/1e-6 = 0. Rotate
+    about the vertical axis and quaternion-z becomes nonzero, so the same feature
+    normalizes to ~5e5, overflows bf16, and every loss goes NaN from the first step.
+    """
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(ds), size=min(n, len(ds)), replace=False)
     feats, deltas = [], []
     hsum = torch.zeros(fut_cap, ds[0][0].size(1))
     hcnt = torch.zeros(fut_cap, 1)
     for k in idx:
         hist, cur, anchor, fut, _ = ds[k]
+        if yaw_aug:
+            th = float(rng.uniform(0, 2 * np.pi))
+            hist, cur, fut = (yaw_rotate(hist, th), yaw_rotate(cur, th),
+                              yaw_rotate(fut, th))
         feats.append(hist)
         seq = torch.cat([cur.unsqueeze(0), fut], dim=0)
         deltas.append(seq[1:] - seq[:-1])
@@ -134,7 +149,8 @@ def build_net(arch, args, dev):
         return DirectTrajPredictor(context_dim=args.ctx, hidden=args.hidden,
                                    blocks=args.blocks, d_model=args.dmodel,
                                    enc_layers=args.enc_layers,
-                                   max_horizon=max(args.fut_cap, 320)).to(dev)
+                                   max_horizon=max(args.fut_cap, 320),
+                                   probabilistic=args.prob).to(dev)
     return SeqPredictor(context_dim=args.ctx, dec_hidden=args.dec_hidden,
                         d_model=args.dmodel, enc_layers=args.enc_layers).to(dev)
 
@@ -154,7 +170,7 @@ def train(args):
                        stride=args.stride, world_ids=[wids[i] for i in ti])
     va = StreamWindows([eps[i] for i in vi], args.hist_cap, args.fut_cap,
                        stride=20, world_ids=[wids[i] for i in vi])
-    fm, fs, dm, dsd, hstd = _fit_norms(tr, args.fut_cap)
+    fm, fs, dm, dsd, hstd = _fit_norms(tr, args.fut_cap, yaw_aug=args.yaw_aug)
     fm, fs, dm, dsd, hstd = (x.to(dev) for x in (fm, fs, dm, dsd, hstd))
     print(f"train windows {len(tr)}  val windows {len(va)}  arch={args.arch}  "
           f"hist_cap={args.hist_cap} fut_cap={args.fut_cap} device={dev}", flush=True)
@@ -200,14 +216,39 @@ def train(args):
             t.to(dev, non_blocking=True) for t in batch)
         if horizon < fut.size(1):                       # curriculum: shorter rollouts
             fut, fvalid = fut[:, :horizon], fvalid[:, :horizon]
+
+        if train_mode and args.yaw_aug:
+            # Gravity singles out -z, so every world here is exactly invariant to
+            # rotation about the vertical axis. The model has no way to know that --
+            # it sees absolute quaternions and world-frame velocities -- so we hand it
+            # the symmetry as free, exactly-correct extra data. Verified against MuJoCo:
+            # re-simulating a yaw-rotated initial condition reproduces the rotated
+            # trajectory to 1e-7 (float32 precision) on `ball`.
+            #
+            # The leaf is a subtler case worth recording: its wind is a fixed
+            # world-frame vector, so an individual leaf episode is NOT yaw-symmetric.
+            # But the wind is drawn as rng.normal(0, 0.7, size=3) -- isotropic in x/y --
+            # so a rotated leaf trajectory is exactly what a rotated wind would have
+            # produced, at identical probability density. The augmentation therefore
+            # still preserves the data distribution, which is what actually matters.
+            th = torch.rand(hist.size(0), device=dev, dtype=hist.dtype) * (2 * math.pi)
+            hist = yaw_rotate(hist, th[:, None])        # same angle across the window
+            fut = yaw_rotate(fut, th[:, None])
+            cur = yaw_rotate(cur, th)
+            c, s = torch.cos(th), torch.sin(th)
+            anchor = torch.stack([c * anchor[:, 0] - s * anchor[:, 1],
+                                  s * anchor[:, 0] + c * anchor[:, 1],
+                                  anchor[:, 2]], dim=-1)
+
         hist_n = (hist - fm) / fs
         if train_mode and args.noise > 0:               # input-noise augmentation
             hist_n = hist_n + args.noise * torch.randn_like(hist_n)
         n_steps = fut.size(1)
         z = net.encode(hist_n, key_padding_mask=hmask)
 
+        log_std = None
         if args.arch == "direct":
-            pred_n, states = net.decode(z, cur, anchor, n_steps, fm, fs, hstd)
+            pred_n, states, log_std = net.decode(z, cur, anchor, n_steps, fm, fs, hstd)
             idx = torch.clamp(torch.arange(n_steps, device=dev), max=hstd.size(0) - 1)
             tgt_n = (fut - cur.unsqueeze(1)) / hstd.index_select(0, idx).unsqueeze(0)
         else:
@@ -222,9 +263,22 @@ def train(args):
         # promoted, which costs nothing measurable.
         pred_n, states = pred_n.float(), states.float()
         tgt_n, fut, cur = tgt_n.float(), fut.float(), cur.float()
+        if log_std is not None:
+            log_std = log_std.float()
 
         denom = fvalid.sum().clamp_min(1.0)
-        shape_loss = (((pred_n - tgt_n) ** 2).sum(-1) * fvalid).sum() / denom
+        if log_std is None:
+            shape_loss = (((pred_n - tgt_n) ** 2).sum(-1) * fvalid).sum() / denom
+        else:
+            # Gaussian NLL in normalized-displacement space. This is what makes the
+            # spread MEAN something: the model is rewarded for widening exactly where
+            # it is genuinely uncertain and punished for widening where it is not, so
+            # the cone becomes calibrated rather than merely wide. The squared-error
+            # term below is kept so the MEAN stays metrically accurate — pure NLL can
+            # buy a better likelihood by inflating sigma instead of sharpening mu.
+            inv_var = torch.exp(-2.0 * log_std)
+            nll = (0.5 * ((tgt_n - pred_n) ** 2) * inv_var + log_std).sum(-1)
+            shape_loss = (nll * fvalid).sum() / denom
         pos_se = ((states[..., 0:3] - fut[..., 0:3]) ** 2).sum(-1)       # (B,T) m^2
         abs_pos = (pos_se * fvalid).sum() / denom                        # metres^2
         if args.scale_norm:
@@ -240,6 +294,7 @@ def train(args):
 
     def save():
         torch.save({"state_dict": net.state_dict(), "arch": args.arch,
+                    "probabilistic": args.prob,
                     "hist_cap": args.hist_cap, "ctx": args.ctx,
                     "dec_hidden": args.dec_hidden, "hidden": args.hidden,
                     "blocks": args.blocks, "dmodel": args.dmodel,
@@ -357,7 +412,8 @@ class LoadedMemory:
                 context_dim=ck["ctx"], hidden=ck.get("hidden", 512),
                 blocks=ck.get("blocks", 4), d_model=ck.get("dmodel", 96),
                 enc_layers=ck.get("enc_layers", 3),
-                max_horizon=ck.get("max_horizon", 320)).to(device)
+                max_horizon=ck.get("max_horizon", 320),
+                probabilistic=ck.get("probabilistic", False)).to(device)
         else:
             self.net = SeqPredictor(
                 context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8),
@@ -370,12 +426,78 @@ class LoadedMemory:
             t("delta_mean"), t("delta_std")
         self.hstd = t("horizon_std") if "horizon_std" in ck else None
         self.worlds = ck.get("worlds", [])
+        self.probabilistic = bool(ck.get("probabilistic", False))
 
     def _decode(self, z, cur, anchor, n_steps):
         if self.arch == "direct":
             return self.net.decode(z, cur, anchor, n_steps, self.fm, self.fs, self.hstd)[1]
         return self.net.decode(z, cur, anchor, n_steps, self.fm, self.fs,
                                self.dm, self.dsd)[1]
+
+    @torch.no_grad()
+    def predict_dist(self, history, cur, n_steps):
+        """Mean trajectory plus the per-horizon standard deviation, both in absolute
+        units. Returns (mean (T,13), sigma (T,13)); sigma is None for a deterministic
+        checkpoint."""
+        dev = self.device
+        h = np.asarray(history[-self.hist_cap:], dtype=np.float32)
+        curs = torch.from_numpy(np.asarray(cur, dtype=np.float32)).unsqueeze(0).to(dev)
+        anchor = curs[:, 0:3]
+        t = torch.from_numpy(h).to(dev).clone()
+        t[:, 0:3] = t[:, 0:3] - anchor[0]
+        z = self.net.encode(((t - self.fm) / self.fs).unsqueeze(0))
+        if self.arch != "direct":
+            _, st = self.net.decode(z, curs, anchor, n_steps, self.fm, self.fs,
+                                    self.dm, self.dsd)
+            return st[0].cpu().numpy(), None
+        _, st, logs = self.net.decode(z, curs, anchor, n_steps, self.fm, self.fs,
+                                      self.hstd)
+        if logs is None:
+            return st[0].cpu().numpy(), None
+        idx = torch.clamp(torch.arange(n_steps, device=dev), max=self.hstd.size(0) - 1)
+        scale = self.hstd.index_select(0, idx)                     # (T,13) absolute units
+        return st[0].cpu().numpy(), (logs[0].exp() * scale).cpu().numpy()
+
+    @torch.no_grad()
+    def sample_futures(self, history, cur, n_steps, n_samples=64, temperature=1.0,
+                       mode="persistent", ground_z=None, rng=None):
+        """A CONE of futures: (n_samples, n_steps, 13).
+
+        The shape of the noise matters more than its size. Two options:
+
+        `persistent` (default) — draw ONE standard normal per sample and hold it fixed
+            across the whole horizon, scaling by the predicted per-horizon sigma. Each
+            sample is then a smooth trajectory that diverges steadily from the mean.
+            This is the physically right structure here: what the model is uncertain
+            about is the *environment* it inferred by watching — a set of constants
+            fixed for the episode — and uncertainty in a constant propagates forward
+            coherently. It is also what makes a cone look like a cone.
+
+        `independent` — fresh noise at every horizon. Marginally identical, but each
+            sample is a jittery path that no physical object could follow. Useful only
+            as a contrast; it is what naive per-step sampling gives you.
+
+        `ground_z` applies the physical guard from the old ensemble cone: once a sample
+        reaches the ground it stays there, instead of sinking through the floor.
+        """
+        mean, sigma = self.predict_dist(history, cur, n_steps)
+        if sigma is None:
+            return mean[None].repeat(n_samples, axis=0)
+        rng = rng or np.random.default_rng()
+        shape = ((n_samples, 1, mean.shape[-1]) if mode == "persistent"
+                 else (n_samples, n_steps, mean.shape[-1]))
+        eps = rng.standard_normal(shape).astype(np.float32)
+        out = mean[None] + eps * (sigma[None] * temperature)
+        q = out[..., 3:7]
+        out[..., 3:7] = q / np.maximum(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8)
+        if ground_z is not None:
+            for s in range(out.shape[0]):
+                below = np.where(out[s, :, 2] <= ground_z)[0]
+                if len(below):
+                    k = int(below[0])
+                    out[s, k:, 0:3] = out[s, k, 0:3]       # freeze where it landed
+                    out[s, k:, 7:13] = 0.0
+        return out
 
     @torch.no_grad()
     def predict(self, history, cur, n_steps):
@@ -487,6 +609,21 @@ def main():
     ap.add_argument("--min-scale", type=float, default=0.05,
                     help="floor on a window's motion scale (m), so near-still windows "
                          "cannot blow up the normalized loss")
+    ap.add_argument("--prob", action="store_true",
+                    help="probabilistic head: predict mean AND spread, train with "
+                         "Gaussian NLL. Enables the cone (see action/cone_eval.py)")
+    # Yaw augmentation is OFF by default, on evidence. The symmetry is real and the
+    # transform is verified exact against MuJoCo (1e-7 on `ball`), but ablating it
+    # same-seed showed no benefit and slower convergence: 17.9 cm vs 17.0 cm after 6
+    # epochs. The reason is visible in audit_randomness.py -- every world already
+    # samples heading isotropically (|R| = 0.006-0.273; pendulums randomize their swing
+    # plane per episode, ball/object launch in random directions), so there is no
+    # directional gap left to fill and the augmentation only adds redundant variety.
+    # Kept because it should matter for a world whose data does NOT cover all headings.
+    ap.add_argument("--yaw-aug", dest="yaw_aug", action="store_true", default=False,
+                    help="random rotation about the vertical axis (exact symmetry; "
+                         "measured to give no gain on the current worlds)")
+    ap.add_argument("--no-yaw-aug", dest="yaw_aug", action="store_false")
     ap.add_argument("--curriculum", type=float, default=0.35,
                     help="start training at this fraction of fut-cap, ramp to 1.0 "
                          "(1.0 = off)")
