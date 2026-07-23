@@ -1,41 +1,64 @@
 """
 train_memory.py — the STREAMING memory model, trained all the way to landing.
 
-Upgrade over train_seq.py:
-  * The memory grows. Instead of a fixed 48-frame window, the encoder reads ALL of
-    the fall observed so far (up to a cap), so it accumulates evidence as the leaf
-    descends — "look at everything that happened, then predict the rest."
-  * We train the decoder to LANDING (the whole remaining trajectory, variable
-    length), not a fixed 80 steps — so long-horizon accuracy is what we optimize.
-  * Variable-length histories and futures are padded + masked so they batch cleanly.
+The encoder reads ALL of the motion observed so far (up to a cap), accumulating
+evidence about the hidden environment as the object moves — "look at everything that
+happened, then predict the rest." The decoder then rolls the whole remaining future
+out, and the loss is over that entire horizon, so long-range accuracy is what we
+actually optimize.
 
-At the end it prints the two numbers that matter — the prediction WINDOW and the
-"sharpens as it falls" curve — so you capture them before the env closes.
+Two decoders are available (`--arch`):
 
-    python -m action.train_memory --data data/leaf --out runs/leaf_mem.pt \
-        --epochs 30 --hist-cap 160 --fut-cap 220 --device cuda
+  gru      the original autoregressive rollout. Integrates one step at a time.
+  direct   the FLOW-MAP decoder (default). Predicts every horizon in parallel.
+           Far faster to train (sequential depth 240 -> 1) and cannot compound
+           error, because horizon 240 is supervised directly rather than through
+           239 earlier predictions. See models.DirectTrajPredictor.
 
-    python -m action.train_memory --measure runs/leaf_mem.pt --data data/leaf
+Two things make the loss trustworthy across a mixed-world dataset:
+
+  * **Scale-normalized position loss.** Raw metres let the big, fast worlds own the
+    gradient: a ball travelling 9 m produces ~500x the squared error of a pendulum
+    swinging 0.4 m, so pendulums were effectively ignored even at 29% of the data —
+    and the chaotic worlds, which have the largest and *least reducible* error of
+    all, dominated hardest. Dividing each window's error by its own motion scale
+    makes every world contribute comparably. Disable with --no-scale-norm.
+  * **Per-world validation.** One blended RMSE across nine worlds with wildly
+    different irreducible error is uninterpretable — it cannot tell "the model
+    stopped learning" from "the chaotic worlds hit their physical floor".
+
+    python -m action.train_memory --data data/all --out runs/general3.pt \
+        --epochs 15 --batch 768 --fut-cap 240 --device cuda
+
+    python -m action.train_memory --measure runs/general3.pt --data data/all
 """
 from __future__ import annotations
 
 import argparse
+import math
+import os
+import sys
+import time
 from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from action.dataset import load_episodes
-from action.models import SeqPredictor
+from action.dataset import load_episodes, load_episodes_tagged
+from action.models import SeqPredictor, DirectTrajPredictor
+
+DT = 0.008
 
 
 class StreamWindows(Dataset):
     """Growing-history windows. For a start point t: history = all frames up to t
-    (capped), future = the rest of the fall up to t+fut_cap."""
+    (capped), future = the rest of the episode up to t+fut_cap."""
 
-    def __init__(self, episodes, hist_cap=160, fut_cap=220, min_hist=12, stride=3):
+    def __init__(self, episodes, hist_cap=160, fut_cap=240, min_hist=12, stride=3,
+                 world_ids=None):
         self.eps = [torch.from_numpy(e).float() for e in episodes]
         self.hist_cap, self.fut_cap, self.min_hist = hist_cap, fut_cap, min_hist
+        self.wid = world_ids if world_ids is not None else [0] * len(episodes)
         self.index = []
         for i, e in enumerate(self.eps):
             for t in range(min_hist, len(e) - 2, stride):
@@ -53,12 +76,12 @@ class StreamWindows(Dataset):
         hist[:, 0:3] = hist[:, 0:3] - anchor            # translation-invariant
         cur = e[t - 1].clone()
         fut = e[t:min(len(e), t + self.fut_cap)].clone()
-        return hist, cur, anchor, fut
+        return hist, cur, anchor, fut, self.wid[i]
 
 
 def collate(batch):
     """Right-pad variable-length histories and futures; build masks."""
-    hists, curs, anchors, futs = zip(*batch)
+    hists, curs, anchors, futs, wids = zip(*batch)
     B = len(batch)
     Lh = max(h.size(0) for h in hists)
     Lf = max(f.size(0) for f in futs)
@@ -73,183 +96,328 @@ def collate(batch):
         fut_pad[b, :f.size(0)] = f
         fut_valid[b, :f.size(0)] = 1.0
     return (hist_pad, torch.stack(curs), torch.stack(anchors),
-            fut_pad, hist_mask, fut_valid)
+            fut_pad, hist_mask, fut_valid, torch.tensor(wids, dtype=torch.long))
 
 
-def _fit_norms(ds, n=6000):
+def _fit_norms(ds, fut_cap, n=6000):
+    """Feature/delta normalizers plus the per-horizon displacement scale table.
+
+    `horizon_std[k]` is the typical size of the displacement k steps ahead. The
+    flow-map decoder predicts displacement in units of it, so its output stays O(1)
+    whether it is asked for 1 step or 240 — without that, the same head would have to
+    emit millimetres and metres from the same weights."""
     idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
     feats, deltas = [], []
+    hsum = torch.zeros(fut_cap, ds[0][0].size(1))
+    hcnt = torch.zeros(fut_cap, 1)
     for k in idx:
-        hist, cur, anchor, fut = ds[k]
+        hist, cur, anchor, fut, _ = ds[k]
         feats.append(hist)
         seq = torch.cat([cur.unsqueeze(0), fut], dim=0)
         deltas.append(seq[1:] - seq[:-1])
+        disp = fut - cur.unsqueeze(0)                    # (T,13) displacement from cur
+        T = disp.size(0)
+        hsum[:T] += disp ** 2
+        hcnt[:T] += 1
     feats, deltas = torch.cat(feats, 0), torch.cat(deltas, 0)
+    horizon_std = torch.sqrt(hsum / hcnt.clamp_min(1)).clamp_min(1e-4)
+    # horizons sampled by too few windows inherit the last well-estimated row
+    good = int((hcnt.squeeze(-1) >= 20).sum().item())
+    if 0 < good < fut_cap:
+        horizon_std[good:] = horizon_std[good - 1]
     return (feats.mean(0), feats.std(0).clamp_min(1e-6),
-            deltas.mean(0), deltas.std(0).clamp_min(1e-6))
+            deltas.mean(0), deltas.std(0).clamp_min(1e-6), horizon_std)
+
+
+def build_net(arch, args, dev):
+    if arch == "direct":
+        return DirectTrajPredictor(context_dim=args.ctx, hidden=args.hidden,
+                                   blocks=args.blocks, d_model=args.dmodel,
+                                   enc_layers=args.enc_layers,
+                                   max_horizon=max(args.fut_cap, 320)).to(dev)
+    return SeqPredictor(context_dim=args.ctx, dec_hidden=args.dec_hidden,
+                        d_model=args.dmodel, enc_layers=args.enc_layers).to(dev)
 
 
 def train(args):
     dev = args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
-    eps = load_episodes(args.data)
+    eps, names = load_episodes_tagged(args.data)
+    worlds = sorted(set(names))
+    w2i = {w: i for i, w in enumerate(worlds)}
+    wids = [w2i[n] for n in names]
+    print(f"worlds: " + ", ".join(f"{w}({names.count(w)})" for w in worlds), flush=True)
+
     perm = np.random.default_rng(args.seed).permutation(len(eps))
     n_val = max(1, int(0.1 * len(eps)))
-    val_eps = [eps[i] for i in perm[:n_val]]
-    tr_eps = [eps[i] for i in perm[n_val:]]
-
-    tr = StreamWindows(tr_eps, args.hist_cap, args.fut_cap, stride=args.stride)
-    va = StreamWindows(val_eps, args.hist_cap, args.fut_cap, stride=20)  # denser, trustworthy val
-    fm, fs, dm, dsd = (x.to(dev) for x in _fit_norms(tr))
-    print(f"train windows {len(tr)}  val windows {len(va)}  "
+    vi, ti = perm[:n_val], perm[n_val:]
+    tr = StreamWindows([eps[i] for i in ti], args.hist_cap, args.fut_cap,
+                       stride=args.stride, world_ids=[wids[i] for i in ti])
+    va = StreamWindows([eps[i] for i in vi], args.hist_cap, args.fut_cap,
+                       stride=20, world_ids=[wids[i] for i in vi])
+    fm, fs, dm, dsd, hstd = _fit_norms(tr, args.fut_cap)
+    fm, fs, dm, dsd, hstd = (x.to(dev) for x in (fm, fs, dm, dsd, hstd))
+    print(f"train windows {len(tr)}  val windows {len(va)}  arch={args.arch}  "
           f"hist_cap={args.hist_cap} fut_cap={args.fut_cap} device={dev}", flush=True)
 
-    net = SeqPredictor(context_dim=args.ctx, dec_hidden=args.dec_hidden,
-                       d_model=args.dmodel, enc_layers=args.enc_layers).to(dev)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.wd)
+    net = build_net(args.arch, args, dev)
+    n_par = sum(p.numel() for p in net.parameters())
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    dl = DataLoader(tr, batch_size=args.batch, shuffle=True, drop_last=True, collate_fn=collate)
-    vdl = DataLoader(va, batch_size=args.batch, shuffle=False, collate_fn=collate)
 
-    def run(batch, train_mode):
-        hist, cur, anchor, fut, hmask, fvalid = (t.to(dev) for t in batch)
+    # AMP: 'auto' turns it on for the flow-map decoder (a wide parallel MLP, which is
+    # exactly what tensor cores are for) and leaves it off for the GRU, whose 240-step
+    # autoregressive chain can drift in fp16.
+    use_amp = (dev.startswith("cuda") and args.amp != "off" and
+               (args.amp != "auto" or args.arch == "direct"))
+    # Pick bf16 ONLY on Ampere or newer (compute capability >= 8). Do NOT use
+    # torch.cuda.is_bf16_supported(): it returns True on a Turing T4 because it counts
+    # *software emulation*, and sm_75 has no bf16 tensor cores at all — autocasting to
+    # bf16 there falls off the fast path entirely and ran at ~2% of the card's peak
+    # (1030 s/epoch). fp16 is the correct choice on Turing and uses the tensor cores.
+    cap = torch.cuda.get_device_capability()[0] if dev.startswith("cuda") else 0
+    bf16 = use_amp and (cap >= 8 if args.amp in ("auto", "on") else args.amp == "bf16")
+    amp_dtype = torch.bfloat16 if bf16 else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and not bf16)
+    if dev.startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print(f"gpu={torch.cuda.get_device_name(0)} sm_{cap}x  "
+              f"AMP={'bf16' if bf16 else ('fp16' if use_amp else 'off')}", flush=True)
+
+    nw = args.workers if sys.platform != "win32" else 0   # spawn would copy all episodes
+    dl = DataLoader(tr, batch_size=args.batch, shuffle=True, drop_last=True,
+                    collate_fn=collate, num_workers=nw, pin_memory=dev.startswith("cuda"),
+                    persistent_workers=nw > 0)
+    vdl = DataLoader(va, batch_size=args.batch, shuffle=False, collate_fn=collate,
+                     num_workers=nw, pin_memory=dev.startswith("cuda"),
+                     persistent_workers=nw > 0)
+    print(f"{n_par/1e6:.2f}M params  batches/epoch {len(dl)}  dataloader workers {nw}",
+          flush=True)
+
+    def losses(batch, train_mode, horizon):
+        hist, cur, anchor, fut, hmask, fvalid, wid = (
+            t.to(dev, non_blocking=True) for t in batch)
+        if horizon < fut.size(1):                       # curriculum: shorter rollouts
+            fut, fvalid = fut[:, :horizon], fvalid[:, :horizon]
         hist_n = (hist - fm) / fs
-        if train_mode and args.noise > 0:                    # input-noise augmentation
+        if train_mode and args.noise > 0:               # input-noise augmentation
             hist_n = hist_n + args.noise * torch.randn_like(hist_n)
-        z = net.encode(hist_n, key_padding_mask=hmask)
         n_steps = fut.size(1)
-        pred_dn, states = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd,
-                                     ckpt_chunk=args.ckpt_chunk)
-        denom = fvalid.sum().clamp_min(1.0)
-        # per-step delta loss (shape of the motion)
-        seq = torch.cat([cur.unsqueeze(1), fut], dim=1)
-        tgt_dn = ((seq[:, 1:] - seq[:, :-1]) - dm) / dsd
-        delta_loss = (((pred_dn - tgt_dn) ** 2).sum(-1) * fvalid).sum() / denom
-        # cumulative POSITION loss (what the window actually measures, in metres)
-        pos_se = ((states[:, :, 0:3] - fut[:, :, 0:3]) ** 2).sum(-1)   # (B, n_steps) m^2
-        pos_loss = (pos_se * fvalid).sum() / denom
-        loss = delta_loss + args.pos_weight * pos_loss
-        if train_mode:
-            opt.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-            opt.step()
-        # select checkpoints on the position error (metres) — the metric we care about
-        return loss.item(), pos_loss.item()
+        z = net.encode(hist_n, key_padding_mask=hmask)
 
-    save = lambda: torch.save(
-        {"state_dict": net.state_dict(), "hist_cap": args.hist_cap, "ctx": args.ctx,
-         "n_time_freq": net.n_time_freq, "dec_hidden": args.dec_hidden,
-         "dmodel": args.dmodel, "enc_layers": args.enc_layers,
-         "feat_mean": fm.cpu().numpy(), "feat_std": fs.cpu().numpy(),
-         "delta_mean": dm.cpu().numpy(), "delta_std": dsd.cpu().numpy()}, args.out)
+        if args.arch == "direct":
+            pred_n, states = net.decode(z, cur, anchor, n_steps, fm, fs, hstd)
+            idx = torch.clamp(torch.arange(n_steps, device=dev), max=hstd.size(0) - 1)
+            tgt_n = (fut - cur.unsqueeze(1)) / hstd.index_select(0, idx).unsqueeze(0)
+        else:
+            pred_n, states = net.decode(z, cur, anchor, n_steps, fm, fs, dm, dsd,
+                                        ckpt_chunk=args.ckpt_chunk)
+            seq = torch.cat([cur.unsqueeze(1), fut], dim=1)
+            tgt_n = ((seq[:, 1:] - seq[:, :-1]) - dm) / dsd
+
+        # Reductions in fp32. Under fp16 autocast the scale-normalized term divides by
+        # as little as min_scale^2 (=0.0025), a 400x amplification that can overflow
+        # fp16's 65504 ceiling; the network stays half-precision, only the loss is
+        # promoted, which costs nothing measurable.
+        pred_n, states = pred_n.float(), states.float()
+        tgt_n, fut, cur = tgt_n.float(), fut.float(), cur.float()
+
+        denom = fvalid.sum().clamp_min(1.0)
+        shape_loss = (((pred_n - tgt_n) ** 2).sum(-1) * fvalid).sum() / denom
+        pos_se = ((states[..., 0:3] - fut[..., 0:3]) ** 2).sum(-1)       # (B,T) m^2
+        abs_pos = (pos_se * fvalid).sum() / denom                        # metres^2
+        if args.scale_norm:
+            # each window's own motion scale: RMS true displacement from `cur`
+            disp2 = ((fut[..., 0:3] - cur[:, None, 0:3]) ** 2).sum(-1)
+            sc2 = ((disp2 * fvalid).sum(1) / fvalid.sum(1).clamp_min(1))
+            sc2 = sc2.clamp_min(args.min_scale ** 2)                     # (B,)
+            pos_term = ((pos_se / sc2[:, None]) * fvalid).sum() / denom
+        else:
+            pos_term = abs_pos
+        loss = shape_loss + args.pos_weight * pos_term
+        return loss, abs_pos, pos_se.detach(), fvalid, wid
+
+    def save():
+        torch.save({"state_dict": net.state_dict(), "arch": args.arch,
+                    "hist_cap": args.hist_cap, "ctx": args.ctx,
+                    "dec_hidden": args.dec_hidden, "hidden": args.hidden,
+                    "blocks": args.blocks, "dmodel": args.dmodel,
+                    "enc_layers": args.enc_layers,
+                    "n_time_freq": getattr(net, "n_time_freq", 12),
+                    "max_horizon": max(args.fut_cap, 320),
+                    "worlds": worlds,
+                    "feat_mean": fm.cpu().numpy(), "feat_std": fs.cpu().numpy(),
+                    "delta_mean": dm.cpu().numpy(), "delta_std": dsd.cpu().numpy(),
+                    "horizon_std": hstd.cpu().numpy()}, args.out)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    def horizon_for(ep):
+        """Curriculum: short rollouts first. Cheaper AND better conditioned early —
+        the encoder learns to identify the environment before it is asked to hold a
+        prediction together for two seconds."""
+        if args.curriculum >= 1.0:
+            return args.fut_cap
+        ramp = min(1.0, ep / max(1.0, 0.6 * args.epochs))
+        return max(16, int(round((args.curriculum + (1 - args.curriculum) * ramp)
+                                 * args.fut_cap)))
 
     best = float("inf")
     for ep in range(args.epochs):
-        net.train(); tr = [run(b, True) for b in dl]
+        H = horizon_for(ep)
+        net.train()
+        t0, tot = time.time(), []
+        for batch in dl:
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                loss, _, _, _, _ = losses(batch, True, H)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            scaler.step(opt); scaler.update()
+            tot.append(loss.item())
+        train_s = time.time() - t0
+
         net.eval()
+        wsse = torch.zeros(len(worlds), device=dev)
+        wcnt = torch.zeros(len(worlds), device=dev)
         with torch.no_grad():
-            va = [run(b, False) for b in vdl]
+            for batch in vdl:
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    _, _, pos_se, fvalid, wid = losses(batch, False, args.fut_cap)
+                per = (pos_se.float() * fvalid).sum(1)                # (B,) m^2 summed
+                cnt = fvalid.sum(1)
+                wsse.index_add_(0, wid, per); wcnt.index_add_(0, wid, cnt)
+        rmse = torch.sqrt(wsse / wcnt.clamp_min(1)).cpu().numpy()      # metres, per world
+        # the checkpoint metric is the MEAN OF PER-WORLD RMSE, so a world is not
+        # allowed to be ignored just because it moves in small numbers
+        score = float(np.mean([r for r in rmse if np.isfinite(r)]))
         sched.step()
-        tr_loss = np.mean([x[0] for x in tr])
-        va_pos = np.mean([x[1] for x in va])                 # val position error (m^2)
         tag = ""
-        if va_pos < best:
-            best = va_pos; save(); tag = "  <-- saved"
-        print(f"epoch {ep+1:3d}  train {tr_loss:.4f}  "
-              f"val_pos {va_pos*1e4:.1f}cm2  (rmse {np.sqrt(va_pos)*100:.1f}cm){tag}", flush=True)
-    print(f"best val_pos rmse {np.sqrt(best)*100:.1f}cm  -> {args.out}", flush=True)
+        if score < best:
+            best = score; save(); tag = "  <-- saved"
+        per_world = "  ".join(f"{worlds[i][:9]} {rmse[i]*100:5.1f}" for i in range(len(worlds)))
+        print(f"epoch {ep+1:3d} [H={H:3d} {train_s:5.1f}s]  train {np.mean(tot):8.4f}  "
+              f"mean-world rmse {score*100:5.1f}cm{tag}\n            {per_world}", flush=True)
+    print(f"\nbest mean-world rmse {best*100:.1f}cm  -> {args.out}", flush=True)
 
     print("\n" + "=" * 60 + "\nKEY RESULTS (share these)\n" + "=" * 60, flush=True)
     _diagnostics(args.out, args.data, dev="cpu")
 
 
 # ----------------------------------------------------------------------------
-def load_mem(ckpt_path, device="cpu"):
-    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    net = SeqPredictor(context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8),
-                       dec_hidden=ck.get("dec_hidden", 128), d_model=ck.get("dmodel", 64),
-                       enc_layers=ck.get("enc_layers", 2)).to(device)
-    net.load_state_dict(ck["state_dict"]); net.eval()
-    t = lambda k: torch.tensor(ck[k], device=device)
-    return net, ck["hist_cap"], t("feat_mean"), t("feat_std"), t("delta_mean"), t("delta_std")
+class LoadedMemory:
+    """A trained memory model plus everything needed to run it.
+
+    Wraps both architectures behind one `predict` / `predict_batch` API so callers
+    (live.py, diagnose_worlds.py) never branch on `arch`.
+    """
+
+    def __init__(self, ckpt_path, device="cpu"):
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        self.arch = ck.get("arch", "gru")            # older checkpoints predate --arch
+        self.device = device
+        if self.arch == "direct":
+            self.net = DirectTrajPredictor(
+                context_dim=ck["ctx"], hidden=ck.get("hidden", 512),
+                blocks=ck.get("blocks", 4), d_model=ck.get("dmodel", 96),
+                enc_layers=ck.get("enc_layers", 3),
+                max_horizon=ck.get("max_horizon", 320)).to(device)
+        else:
+            self.net = SeqPredictor(
+                context_dim=ck["ctx"], n_time_freq=ck.get("n_time_freq", 8),
+                dec_hidden=ck.get("dec_hidden", 128), d_model=ck.get("dmodel", 64),
+                enc_layers=ck.get("enc_layers", 2)).to(device)
+        self.net.load_state_dict(ck["state_dict"]); self.net.eval()
+        t = lambda k: torch.tensor(ck[k], device=device)
+        self.hist_cap = ck["hist_cap"]
+        self.fm, self.fs, self.dm, self.dsd = t("feat_mean"), t("feat_std"), \
+            t("delta_mean"), t("delta_std")
+        self.hstd = t("horizon_std") if "horizon_std" in ck else None
+        self.worlds = ck.get("worlds", [])
+
+    def _decode(self, z, cur, anchor, n_steps):
+        if self.arch == "direct":
+            return self.net.decode(z, cur, anchor, n_steps, self.fm, self.fs, self.hstd)[1]
+        return self.net.decode(z, cur, anchor, n_steps, self.fm, self.fs,
+                               self.dm, self.dsd)[1]
+
+    @torch.no_grad()
+    def predict(self, history, cur, n_steps):
+        """history: (Lh,13) absolute states observed so far. cur: (13,). -> (n,13)."""
+        return self.predict_batch([history], np.asarray(cur)[None], n_steps)[0]
+
+    @torch.no_grad()
+    def predict_batch(self, histories, curs, n_steps):
+        """Predict from MANY observation points at once -> (B, n_steps, 13).
+
+        Every prediction is independent of the others, so they batch perfectly. This
+        is what makes rendering fast: one padded encode + one decode replaces B
+        separate forward passes, collapsing the wall-clock cost of a whole video from
+        B sequential rollouts to one.
+        """
+        dev = self.device
+        hs = [np.asarray(h[-self.hist_cap:], dtype=np.float32) for h in histories]
+        B, L = len(hs), max(len(h) for h in hs)
+        curs = torch.from_numpy(np.asarray(curs, dtype=np.float32)).to(dev)
+        anchor = curs[:, 0:3]
+        pad = torch.zeros(B, L, hs[0].shape[1], device=dev)
+        mask = torch.ones(B, L, dtype=torch.bool, device=dev)
+        for b, h in enumerate(hs):
+            # .clone() is required: torch.from_numpy SHARES memory with the numpy
+            # array, and on CPU .to("cpu") is a no-op, so subtracting the anchor
+            # in place would silently rewrite the caller's trajectory.
+            t = torch.from_numpy(h).to(dev).clone()
+            t[:, 0:3] = t[:, 0:3] - anchor[b]
+            pad[b, :len(h)] = t
+            mask[b, :len(h)] = False
+        z = self.net.encode((pad - self.fm) / self.fs, key_padding_mask=mask)
+        return self._decode(z, curs, anchor, n_steps).cpu().numpy()
 
 
-@torch.no_grad()
-def mem_predict(net, hist_cap, fm, fs, dm, dsd, history, cur, n_steps, device="cpu"):
-    """history: (Lh,13) absolute (all observed so far). cur: (13,) current state."""
-    w = torch.from_numpy(np.asarray(history[-hist_cap:])).float().to(device)
-    anchor = torch.from_numpy(np.asarray(cur[0:3])).float().to(device)
-    hn = w.clone(); hn[:, 0:3] = hn[:, 0:3] - anchor
-    z = net.encode(((hn - fm) / fs).unsqueeze(0))
-    cur_t = torch.from_numpy(np.asarray(cur)).float().unsqueeze(0).to(device)
-    _, states = net.decode(z, cur_t, anchor.unsqueeze(0), n_steps, fm, fs, dm, dsd)
-    return states[0].cpu().numpy()
+def load_mem(ckpt_path, device="cpu") -> LoadedMemory:
+    return LoadedMemory(ckpt_path, device)
+
+
+def mem_predict(mem, history, cur, n_steps):
+    return mem.predict(history, cur, n_steps)
 
 
 def _diagnostics(ckpt, data, dev="cpu"):
-    net, hist_cap, fm, fs, dm, dsd = load_mem(ckpt, dev)
+    mem = load_mem(ckpt, dev)
     eps = load_episodes(data)
     # evaluate on the tail of the dataset (a hardcoded eps[1400:1470] silently
     # produced an EMPTY set — and a crash — on any dataset smaller than that)
     ev = eps[-70:] if len(eps) > 70 else eps
-    dt = 0.008
 
-    # (1) window: predict to landing from an early point (12 frames watched)
+    print("prediction error vs horizon (watched only first 12 frames):", flush=True)
     errs = []
     for traj in ev:
         if len(traj) < 40:
             continue
         t0 = 12
-        pred = mem_predict(net, hist_cap, fm, fs, dm, dsd, traj[:t0], traj[t0 - 1],
-                           len(traj) - t0, dev)
+        pred = mem.predict(traj[:t0], traj[t0 - 1], len(traj) - t0)
         errs.append(np.linalg.norm(pred[:, 0:3] - traj[t0:, 0:3], axis=1))
     maxlen = max(len(e) for e in errs)
     avg = np.array([np.mean([e[i] for e in errs if len(e) > i]) for i in range(maxlen)])
-    print("prediction error vs horizon (watched only first 12 frames):", flush=True)
     for sec in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]:
-        i = int(sec / dt)
+        i = int(sec / DT)
         if i < len(avg):
-            print(f"  {sec:4.2f}s ({sec*1.8:.2f} m fall): err {avg[i]*100:6.1f} cm", flush=True)
-    cross = np.where(avg > 0.10)[0]
-    print(f"  WINDOW (err<10cm): {cross[0]*dt:.2f}s ~= {cross[0]*dt*1.8:.2f} m of fall"
-          if len(cross) else f"  WINDOW: FULL FALL <10cm! max {avg.max()*100:.1f}cm", flush=True)
+            print(f"  {sec:4.2f}s: err {avg[i]*100:6.1f} cm", flush=True)
 
-    # (2) sharpens as it falls: fixed 0.48s-ahead error from growing observation
+    print("\nsharpens as it watches? (fixed 0.48s-ahead error, growing memory):", flush=True)
     H = 60
-    print("\nsharpens as it falls? (fixed 0.48s-ahead error, growing memory):", flush=True)
     for fr in [0.20, 0.35, 0.50, 0.65]:
         es = []
         for traj in ev:
             t0 = int(fr * len(traj))
             if t0 < 12 or t0 + H >= len(traj):
                 continue
-            pred = mem_predict(net, hist_cap, fm, fs, dm, dsd, traj[:t0], traj[t0 - 1], H, dev)
+            pred = mem.predict(traj[:t0], traj[t0 - 1], H)
             es.append(np.linalg.norm(pred[:, 0:3] - traj[t0:t0 + H, 0:3], axis=1)[-1])
         if es:
-            print(f"  watched {int(fr*100):2d}% of fall: +0.48s err = {np.mean(es)*100:5.1f} cm",
+            print(f"  watched {int(fr*100):2d}%: +0.48s err = {np.mean(es)*100:5.1f} cm",
                   flush=True)
-
-    # (3) THE honest window: how far ahead can it see, given it has watched enough?
-    # 12 frames can't identify a 1.6s sway; this seeds from later and predicts to
-    # landing, reporting the window (err<10cm) as a function of observation.
-    print("\nwindow vs how much it watched first (predict to landing):", flush=True)
-    for fr in [0.20, 0.35, 0.50]:
-        errs = []
-        for traj in ev:
-            t0 = int(fr * len(traj))
-            if t0 < 12 or len(traj) - t0 < 10:
-                continue
-            pred = mem_predict(net, hist_cap, fm, fs, dm, dsd, traj[:t0], traj[t0 - 1],
-                               len(traj) - t0, dev)
-            errs.append(np.linalg.norm(pred[:, 0:3] - traj[t0:, 0:3], axis=1))
-        if not errs:
-            continue
-        m = max(len(e) for e in errs)
-        avg = np.array([np.mean([e[i] for e in errs if len(e) > i]) for i in range(m)])
-        cross = np.where(avg > 0.10)[0]
-        win = f"{cross[0]*dt:.2f}s ~= {cross[0]*dt*1.8:.2f} m ahead" if len(cross) \
-            else f"to landing (<10cm the whole way, max {avg.max()*100:.0f}cm)"
-        print(f"  watched {int(fr*100):2d}% of fall: WINDOW = {win}", flush=True)
 
 
 def measure(args):
@@ -259,26 +427,39 @@ def measure(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default="data/leaf")
-    ap.add_argument("--out", type=str, default="runs/leaf_mem.pt")
+    ap.add_argument("--data", type=str, default="data/all")
+    ap.add_argument("--out", type=str, default="runs/general.pt")
     ap.add_argument("--measure", type=str, default=None)
+    ap.add_argument("--arch", type=str, default="direct", choices=["direct", "gru"])
     ap.add_argument("--hist-cap", type=int, default=160)
-    ap.add_argument("--fut-cap", type=int, default=220)
-    ap.add_argument("--stride", type=int, default=3)
+    ap.add_argument("--fut-cap", type=int, default=240)
+    ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--ctx", type=int, default=96)
-    ap.add_argument("--dec-hidden", type=int, default=256)
     ap.add_argument("--dmodel", type=int, default=96)
     ap.add_argument("--enc-layers", type=int, default=3)
-    ap.add_argument("--ckpt-chunk", type=int, default=24,
-                    help="gradient-checkpoint the rollout in chunks of this many steps "
-                         "(0 = off); lets the big model train at a big batch")
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--hidden", type=int, default=512, help="direct: decoder width")
+    ap.add_argument("--blocks", type=int, default=4, help="direct: residual blocks")
+    ap.add_argument("--dec-hidden", type=int, default=256, help="gru: decoder width")
+    ap.add_argument("--ckpt-chunk", type=int, default=24, help="gru: rollout checkpointing")
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--batch", type=int, default=768)
+    ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--wd", type=float, default=3e-4)
     ap.add_argument("--noise", type=float, default=0.05)
-    ap.add_argument("--pos-weight", type=float, default=10.0,
-                    help="weight on the cumulative position (metre) loss")
+    ap.add_argument("--pos-weight", type=float, default=10.0)
+    ap.add_argument("--scale-norm", dest="scale_norm", action="store_true", default=True)
+    ap.add_argument("--no-scale-norm", dest="scale_norm", action="store_false")
+    ap.add_argument("--min-scale", type=float, default=0.05,
+                    help="floor on a window's motion scale (m), so near-still windows "
+                         "cannot blow up the normalized loss")
+    ap.add_argument("--curriculum", type=float, default=0.35,
+                    help="start training at this fraction of fut-cap, ramp to 1.0 "
+                         "(1.0 = off)")
+    ap.add_argument("--amp", type=str, default="auto",
+                    choices=["auto", "on", "off", "fp16", "bf16"],
+                    help="auto = on for --arch direct, dtype chosen by GPU capability "
+                         "(bf16 needs sm_80+; a T4 is sm_75 and must use fp16)")
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()

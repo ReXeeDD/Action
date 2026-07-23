@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from action.worlds import make_world
-from action.train_memory import load_mem, mem_predict
+from action.train_memory import load_mem
 
 DT = 0.008
 
@@ -61,8 +61,7 @@ def _baselines(traj, t0, H):
     return freeze, constv
 
 
-def evaluate(world_name, net, hist_cap, fm, fs, dm, dsd, n_eps, seed,
-             max_steps, horizons, watch_frac, device):
+def evaluate(world_name, mem, n_eps, seed, max_steps, horizons, watch_frac):
     eps = rollout_episodes(world_name, n_eps, seed, max_steps)
     if not eps:
         return None
@@ -78,8 +77,7 @@ def evaluate(world_name, net, hist_cap, fm, fs, dm, dsd, n_eps, seed,
         if t0 + min(horizons) >= len(traj):
             continue
         H = min(Hmax, len(traj) - t0)
-        pred = mem_predict(net, hist_cap, fm, fs, dm, dsd,
-                           traj[:t0], traj[t0 - 1], H, device)
+        pred = mem.predict(traj[:t0], traj[t0 - 1], H)
         truth = traj[t0:t0 + H, 0:3]
         fz, cv = _baselines(traj, t0, H)
         for h in horizons:
@@ -136,9 +134,11 @@ def main():
 
     horizons = [int(x) for x in args.horizons.split(",")]
     worlds = [w.strip() for w in args.worlds.split(",")]
-    net, hist_cap, fm, fs, dm, dsd = load_mem(args.ckpt, args.device)
+    mem = load_mem(args.ckpt, args.device)
+    dsd, fs = mem.dsd, mem.fs
 
-    print(f"ckpt={args.ckpt}  hist_cap={hist_cap}  watched={args.watch:.0%} of episode")
+    print(f"ckpt={args.ckpt}  arch={mem.arch}  hist_cap={mem.hist_cap}  "
+          f"watched={args.watch:.0%} of episode")
     print("global normalizer the model was trained with:")
     print(f"  delta_std pos  = {np.round(dsd.cpu().numpy()[0:3], 5)}")
     print(f"  delta_std vel  = {np.round(dsd.cpu().numpy()[7:10], 5)}")
@@ -154,8 +154,8 @@ def main():
 
     results = []
     for w in worlds:
-        r = evaluate(w, net, hist_cap, fm, fs, dm, dsd, args.episodes, args.seed,
-                     args.max_steps, horizons, args.watch, args.device)
+        r = evaluate(w, mem, args.episodes, args.seed, args.max_steps, horizons,
+                     args.watch)
         if r is None:
             continue
         results.append(r)

@@ -19,6 +19,7 @@ Key design choices, and why:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 import numpy as np
 
@@ -58,13 +59,37 @@ class Normalizer:
         return {"mean": self.mean, "std": self.std}
 
 
-def load_episodes(data_dir: str | Path) -> list[np.ndarray]:
-    data_dir = Path(data_dir)
+def _episode_files(data_dir: Path) -> list[Path]:
     # exclude the ep_*_wind.npy context files saved alongside each trajectory
     files = sorted(f for f in data_dir.glob("ep_*.npy") if not f.stem.endswith("_wind"))
     if not files:
         raise FileNotFoundError(f"no episodes in {data_dir} — run generate_data.py first")
-    return [np.load(f) for f in files]
+    return files
+
+
+def load_episodes(data_dir: str | Path) -> list[np.ndarray]:
+    return [np.load(f) for f in _episode_files(Path(data_dir))]
+
+
+_EP_RE = re.compile(r"^ep_(.+)_(\d{5})$")
+
+
+def load_episodes_tagged(data_dir: str | Path) -> tuple[list[np.ndarray], list[str]]:
+    """Episodes plus the world each came from, recovered from its filename.
+
+    `generate_data.py --tag` writes `ep_<world>_<idx>.npy`, so a directory holding
+    many worlds still knows which is which. That lets validation be reported
+    PER WORLD — without it you get one blended number across worlds whose
+    irreducible error differs by an order of magnitude (a chaotic 4-body problem
+    and an integrable pendulum averaged together tell you nothing about either).
+    """
+    files = _episode_files(Path(data_dir))
+    eps, names = [], []
+    for f in files:
+        m = _EP_RE.match(f.stem)
+        eps.append(np.load(f))
+        names.append(m.group(1) if m else "unknown")
+    return eps, names
 
 
 def build_supervised(episodes: list[np.ndarray], history: int = 6):

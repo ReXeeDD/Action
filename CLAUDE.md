@@ -425,6 +425,15 @@ rotate each training trajectory about the vertical axis.
 | `live.py` video frozen after generalizing | removed the per-frame pose-set; the universal 13-dim state **cannot** pose a pendulum (its `qpos` is joint angles) | store `qpos/qvel` snapshots alongside the trajectory |
 | Kaggle OOM at batch 8192/4096/3072 | **two independent** sources: encoder attention is O(L²·batch), decoder backprop is O(fut_cap·batch·dec_hidden) | gradient checkpointing (`--ckpt-chunk`), lower batch, `expandable_segments:True` |
 | Mixed-world dataset filename collisions | every world wrote `ep_00000.npy` | `--tag` prefix (defaults to world name) → many worlds share one `--out` dir |
+| **All pendulum data physically impossible** (`d(pos)/dt` disagreed with `linvel` by 79–100%) | position read from `data.xpos` (body **frame origin**) but velocity from `mj_objectVelocity` (**centre of mass**) — different points | `xpos` → `xipos` (§15b) |
+| **`pendulum1` target never moved** (path span 0.0000 m) | its body frame origin *is* the fixed pivot | same fix — the CoM does move |
+| Pendulum skill collapsed past ~1 s **even for the integrable pendulum1** | trained `--fut-cap 120` (0.96 s) but rendered 260 frames (2.08 s) — an oscillator cannot extrapolate phase past its trained horizon | `--fut-cap 240` (§15c) |
+| Orange predicted path frozen as a **single point** on pendulums | `live.py` hardcoded `GROUND_Z = 0.03`, but pendulum ground planes sit at −0.68/−1.03/−1.30 and the bob swings below z=0 → all 260 frames "underground" → path cut to 1 | read the plane out of the model; cut at `ground + 0.03`; no plane ⇒ no cut (§15d) |
+| Pendulums ignored by the loss despite being 29% of the data | loss in raw metres² — a 9 m ball outweighs a 0.4 m pendulum ~500× | scale-normalized position loss (§15f) |
+| The 35 cm val plateau was uninterpretable | one blended RMSE over nine worlds with wildly different irreducible error | per-world validation; checkpoint on **mean of per-world RMSE** (§15f) |
+| Training slow (150 s/epoch) | 240 *sequential* GRU steps per batch — sequential depth, not arithmetic | flow-map decoder, all horizons in parallel → 50 s/epoch (§15e) |
+| `predict()` silently corrupted the caller's trajectory | `torch.from_numpy` shares memory and `.to("cpu")` is a no-op, so the in-place anchor subtraction wrote through | `.clone()` |
+| `_diagnostics` crashed on any dataset < 1400 episodes | hardcoded `eps[1400:1470]` → empty slice | use the tail, `eps[-70:]` |
 
 ### 14f. Commands
 ```bash
@@ -457,6 +466,138 @@ train without it, and measure on it. That turns "generalizes" from a claim into 
 `action/models_general.py` — a multi-entity graph/attention net (permutation-equivariant,
 verified on 1–12 bodies). Built before correction #1; kept in case true multi-body scene
 prediction is ever wanted, but it is **not** the current direction.
+
+---
+
+## 15. "The pendulum is trash" — autopsy, and what it actually was
+
+The first general model (`runs/general.pt`) handled the ball and free-falling objects
+well but was useless on pendulums. The tempting explanation was **chaos** (pendulum3 =
+679,000×, §14c). That explanation was **wrong**, and the decisive test proved it:
+`pendulum1` is **integrable** — 28×, no chaos, provably predictable — and it failed just
+as badly. Three separate bugs, none of them physics.
+
+### 15a. The measurement tool (`action/diagnose_worlds.py`)
+Raw centimetres are meaningless across worlds (a ball travels 8.8 m, a pendulum tip lives
+inside a 1 m sphere), so this scores against baselines the model must beat:
+
+    skill = 1 - err_model / err_freeze        freeze  = "it never moves again"
+                                              const-v = "it keeps its current velocity"
+
+skill 1.0 = perfect, 0.0 = no better than a rock, negative = worse than assuming it
+stopped. It also dumps per-world motion scale against the single global normalizer.
+**This tool is how every claim below was established.** Note that `freeze` is a *strong*
+baseline for a pendulum (bounded orbit), so pendulum skill is harder-won than ball skill.
+
+### 15b. BUG 1 — position and velocity described different points
+`entities.entity_state` read position from `data.xpos` (the body **frame origin**) but
+velocity from `mj_objectVelocity`, which reports **at the centre of mass**. For a free
+body those coincide (the geom is centred on its frame), so leaf/ball/object were fine.
+A pendulum link's frame sits at its **hinge**, its CoM half a link away. Measured
+`|d(pos)/dt − linvel|`:
+
+| world | mismatch |
+|---|---|
+| object / ball | 4.3% (contact impulses — fine) |
+| leaf | 0.6% |
+| **pendulum1** | **100.0%** |
+| **pendulum2** | **79.1%** |
+| **pendulum3** | **79.5%** |
+
+Worse, `pendulum1`'s target frame origin **is** the fixed pivot: its recorded path span
+over 400 frames was **0.0000 m** while the true chain tip swept 0.7009 m. Every
+pendulum1 episode was a stationary point annotated with a velocity of 0.78 m/s —
+physically impossible data that no model can learn. Fix: `xpos` → `xipos`, one line,
+also the physically correct choice since F=ma holds at the CoM. Mismatch → 0.1/0.2/0.5%,
+free-body worlds untouched. **All pendulum data had to be regenerated.**
+
+### 15c. BUG 2 — the horizon collapse was a training artifact
+Trained with `--fut-cap 120` (0.96 s) but rendered with `n_ahead=260` (2.08 s). Skill
+held to 0.96 s and collapsed past it **on every pendulum, including the integrable
+one** — exactly at the trained-rollout boundary. Ballistic worlds extrapolate past it
+benignly (a parabola stays a parabola); an oscillator does not, because phase must be
+maintained. Fix: `--fut-cap 240`. Combined with 15b:
+
+| @1.92 s | before | after |
+|---|---|---|
+| pendulum1 | +0.01 (15.0 cm) | **+0.38 (8.9 cm)** |
+| pendulum2 | +0.05 (36.0 cm) | **+0.40 (20.5 cm)** |
+| pendulum3 | **−0.46** (50.7 cm) | **+0.32 (23.6 cm)** |
+
+No negative skill anywhere afterwards; errors roughly halved on every pendulum.
+
+### 15d. BUG 3 — the renderer threw the prediction away
+Even after both fixes the video showed a **frozen orange cross** on the pendulum. Cause:
+`live.py` hardcoded `GROUND_Z = 0.03` and cut the predicted path at the first frame
+below it. But a pendulum's ground plane is at `-(chain length)-0.3` — measured **-0.676
+/ -1.031 / -1.298** — and the bob swings *below z=0* for half of every cycle. So all 260
+predicted frames counted as "underground", the path was truncated to **1 point**, and the
+marker froze on the current position. **The model was predicting correctly the whole
+time; the renderer discarded it.** Fix: read the ground plane out of the model
+(`live.ground_level`) and cut at `ground + 0.03`; worlds with no plane geom (n-body) are
+never cut. Ball/object behaviour is bit-identical (their plane is at z=0). The "predicted
+landing" caption is now suppressed for worlds that never land.
+
+### 15e. Faster training — the flow-map decoder (`models.DirectTrajPredictor`)
+`SeqPredictor` integrates 240 *sequential* GRU cells per batch, each a tiny matmul: the
+GPU idles, gradient checkpointing is forced on to fit memory, and error compounds along
+the chain. **The sequential depth, not the arithmetic, was the cost.**
+
+But no recurrence is needed. For a deterministic system the future is a *function* of
+(state, environment, elapsed time) — the **flow map** `x(t0+k·dt) = Φ(k; x0, θ)`. The
+encoder already infers θ as the context `z`, so Φ can be learned directly and every
+horizon evaluated **in parallel**: one wide batched MLP instead of a 240-deep chain.
+This is the solution-operator view (DeepONet / neural operators) rather than the
+numerical-integrator view. The decoder gets two time bases — the physical 0.008–0.25
+rad/step band (oscillation, as the GRU clock had) plus NeRF-style octaves on `k/k_max`
+(smooth growth of displacement) — and predicts displacement in units of a fitted
+per-horizon scale table so its output stays O(1) from 1 step to 240.
+
+Head-to-head, identical data/settings/batch, curriculum off:
+
+| arch | s/epoch | params | 3-epoch mean-world RMSE |
+|---|---|---|---|
+| `gru` | 150 / 152 / 212 | 0.70M | 14.7 cm |
+| **`direct`** | **50 / 51 / 53** | 4.66M | **14.8 cm** |
+
+**~3× faster at identical accuracy**, with 6.6× more parameters and no checkpointing.
+After only 3 epochs on pendulum data it already beat the 12-epoch `general2.pt`:
+pendulum1 +0.38 → **+0.66**, pendulum2 +0.40 → **+0.51** at 1.92 s.
+
+### 15f. Accuracy — scale-normalized loss and per-world validation
+Two more things were silently wrong for a mixed-world dataset:
+
+* **The loss was in raw metres²**, so a ball travelling 9 m produced ~500× the squared
+  error of a pendulum swinging 0.4 m. Pendulums were effectively ignored at 29% of the
+  data, and the **chaotic** worlds — largest error, *least* reducible — dominated the
+  gradient hardest. Now each window's error is divided by its own RMS displacement
+  (floored at `--min-scale` so near-still windows can't blow up), making every world
+  contribute comparably. `--no-scale-norm` restores the old behaviour.
+* **Validation was one blended number** across nine worlds whose irreducible error
+  differs by an order of magnitude — it could not distinguish "stopped learning" from
+  "the chaotic worlds hit their physical floor", which is exactly why the 35 cm plateau
+  was uninterpretable. Now `load_episodes_tagged` recovers each episode's world from its
+  `ep_<world>_<idx>.npy` filename and validation prints **per world**, with the
+  checkpoint metric being the **mean of per-world RMSE** so no world can be ignored for
+  moving in small numbers.
+
+Also added: AMP (bf16/fp16, auto-on for `direct`), dataloader workers (0 on Windows —
+spawn would copy every episode into each worker), and a rollout-length **curriculum**
+(`--curriculum 0.35`) that starts short and ramps to full — cheaper early and better
+conditioned, since the encoder learns to identify the environment before it is asked to
+hold a two-second prediction together.
+
+### 15g. Faster rendering — batched prediction
+`live.py` called the model once per frame: ~450 frames × 260 sequential rollout steps, at
+batch 1, on CPU. But every frame's prediction depends only on that frame's history —
+never on another frame's prediction — and the whole trajectory is simulated *before* the
+render loop, so they all batch perfectly. Now one padded `encode` + one `decode` per
+chunk (`--pred-batch`), with `--device cuda`. A 446-frame pendulum video renders in
+**8.8 s** including simulation and rendering.
+
+`LoadedMemory` (in `train_memory.py`) replaced the old 6-tuple `load_mem` return, wrapping
+both architectures behind one `predict` / `predict_batch` API so callers never branch on
+`arch`. Old `gru` checkpoints still load (`arch` defaults to `"gru"` when absent).
 
 ---
 
@@ -510,6 +651,19 @@ prediction is ever wanted, but it is **not** the current direction.
   integration, pendulum-planarity and n-body direction-bias bugs it exposed (see §14e).
 - **`--tag`** on data generation so many worlds share one dataset; **`--world`** on `live.py`.
 - **Full error/fix table written up in §14e.**
+- **`diagnose_worlds.py`** — per-world skill against freeze/const-v baselines, because raw
+  centimetres cannot be compared across worlds. Every §15 claim rests on it.
+- **Pendulum autopsy (§15)** — chased "the pendulum is trash" to *three* bugs, none of them
+  chaos. The decisive test was `pendulum1`: it is **integrable**, so its failure ruled chaos
+  out immediately. Fixed the CoM/frame-origin data corruption, the trained-horizon collapse,
+  and the renderer's hardcoded ground plane.
+- **Flow-map decoder** (`DirectTrajPredictor`) — dropped the autoregressive rollout for a
+  parallel solution operator. 3× faster training at equal accuracy; also removes compounding
+  error and the need for gradient checkpointing.
+- **Scale-normalized loss + per-world validation** — stopped the big/chaotic worlds from
+  owning the gradient, and made the plateau diagnosable instead of a single blended number.
+- **Batched prediction in `live.py`** + `--device cuda` — per-frame predictions are mutually
+  independent, so a whole video is a handful of batched forward passes.
 ```
 Remember: report outcomes faithfully. When a prediction turns out wrong (e.g. "determinism
 will open the window"), say so plainly and explain what the measurement actually showed.

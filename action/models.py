@@ -217,3 +217,122 @@ class SeqPredictor(nn.Module):
             j += c
         return torch.cat(dn_all, dim=1), torch.cat(st_all, dim=1)
 
+
+# ---------------------------------------------------------------------------
+# The FLOW-MAP predictor — same job as SeqPredictor, but not autoregressive.
+#
+# SeqPredictor integrates the future one step at a time. That is 240 *sequential*
+# GRU cells per training batch, each a tiny matmul: the GPU spends its life waiting,
+# gradient checkpointing is forced on to fit memory, and errors compound along the
+# chain. The sequential depth — not the arithmetic — is what makes training slow.
+#
+# But we do not actually need a recurrence. For a deterministic system the future is
+# a *function* of (initial state, environment, elapsed time):
+#
+#       x(t0 + k*dt) = Phi(k ; x0, theta)          <- the flow map of the ODE
+#
+# The encoder already infers theta as the context z, so we can learn Phi directly and
+# evaluate every horizon k = 1..T **in parallel** — one big batched MLP instead of a
+# 240-deep chain. This is the classical solution-operator view (DeepONet / neural
+# operators) rather than the numerical-integrator view.
+#
+# Consequences:
+#   * ~sequential depth 240 -> 1, so the GPU is actually saturated.
+#   * no compounding error: horizon 240 is supervised directly, not through 239
+#     earlier predictions.
+#   * no gradient checkpointing needed.
+#   * any horizon can be queried directly, including ones between training samples.
+# The cost is that smoothness across k is learned rather than structural, which the
+# time embedding below is designed to supply.
+# ---------------------------------------------------------------------------
+class _ResBlock(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.n1 = nn.LayerNorm(d)
+        self.f1 = nn.Linear(d, 2 * d)
+        self.f2 = nn.Linear(2 * d, d)
+
+    def forward(self, x):
+        return x + self.f2(nn.functional.gelu(self.f1(self.n1(x))))
+
+
+class DirectTrajPredictor(nn.Module):
+    """Context encoder + parallel flow-map decoder.
+
+    Shares `TrajContextEncoder` with `SeqPredictor`, so the "watch the motion and
+    infer the environment" half is unchanged; only the rollout is replaced.
+    """
+
+    def __init__(self, state_dim: int = STATE_DIM, context_dim: int = 96,
+                 hidden: int = 512, blocks: int = 4, d_model: int = 96, nhead: int = 4,
+                 enc_layers: int = 3, n_phys_freq: int = 12, n_oct_freq: int = 10,
+                 max_horizon: int = 320):
+        super().__init__()
+        self.encoder = TrajContextEncoder(state_dim, d_model, nhead, enc_layers, context_dim)
+        self.max_horizon = max_horizon
+        # Two complementary time bases, because horizon has two kinds of structure:
+        #  * physical band  — the same 0.008..0.25 rad/step band the GRU clock used,
+        #    matched to the leaf's sway and the pendulums' swing, so OSCILLATION is
+        #    representable at the right frequencies.
+        #  * octave band on tau = k/max_horizon — NeRF-style, resolves the smooth
+        #    monotone GROWTH of displacement with elapsed time at every scale.
+        self.n_phys_freq, self.n_oct_freq = n_phys_freq, n_oct_freq
+        self.register_buffer(
+            "phys_freqs",
+            torch.exp(torch.linspace(math.log(0.008), math.log(0.25), n_phys_freq)))
+        self.register_buffer(
+            "oct_freqs", math.pi * torch.pow(2.0, torch.arange(n_oct_freq).float()))
+        time_dim = 1 + 2 * n_phys_freq + 2 * n_oct_freq
+        self.inp = nn.Linear(context_dim + state_dim + time_dim, hidden)
+        self.blocks = nn.ModuleList([_ResBlock(hidden) for _ in range(blocks)])
+        self.norm = nn.LayerNorm(hidden)
+        self.out = nn.Linear(hidden, state_dim)
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)  # start at "no motion"
+        self.state_dim, self.context_dim = state_dim, context_dim
+
+    def encode(self, hist_feat, key_padding_mask=None):
+        return self.encoder(hist_feat, key_padding_mask)
+
+    def time_embed(self, k):
+        """k: (T,) float horizon indices (1-based) -> (T, time_dim)."""
+        tau = (k / self.max_horizon).unsqueeze(-1)                     # (T,1)
+        ph = k.unsqueeze(-1) * self.phys_freqs                         # (T,F)
+        oc = tau * self.oct_freqs                                      # (T,F)
+        return torch.cat([tau, torch.sin(ph), torch.cos(ph),
+                          torch.sin(oc), torch.cos(oc)], dim=-1)
+
+    def decode(self, z, cur_state, anchor_pos, n_steps, feat_mean, feat_std,
+               horizon_std, quat_norm: bool = True):
+        """z:(B,C)  cur_state:(B,13)  horizon_std:(H,13) per-horizon displacement scale.
+
+        Returns (normalized displacement (B,T,13), absolute states (B,T,13)).
+
+        Every horizon is computed at once — the T axis is pure batch, with no
+        dependency between steps.
+        """
+        B = z.size(0)
+        dev = z.device
+        feat_rel = torch.cat([cur_state[:, 0:3] - anchor_pos, cur_state[:, 3:]], dim=-1)
+        feat = (feat_rel - feat_mean) / feat_std                       # (B,13)
+        k = torch.arange(1, n_steps + 1, device=dev, dtype=z.dtype)
+        te = self.time_embed(k)                                        # (T,time_dim)
+
+        x = torch.cat([
+            z.unsqueeze(1).expand(B, n_steps, -1),
+            feat.unsqueeze(1).expand(B, n_steps, -1),
+            te.unsqueeze(0).expand(B, n_steps, -1)], dim=-1)
+        h = self.inp(x)
+        for blk in self.blocks:
+            h = blk(h)
+        disp_n = self.out(self.norm(h))                                # (B,T,13)
+
+        # horizons past the fitted table reuse the last scale (mild extrapolation)
+        idx = torch.clamp(torch.arange(n_steps, device=dev), max=horizon_std.size(0) - 1)
+        scale = horizon_std.index_select(0, idx).unsqueeze(0)          # (1,T,13)
+        states = cur_state.unsqueeze(1) + disp_n * scale
+        if quat_norm:
+            q = states[..., 3:7]
+            q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            states = torch.cat([states[..., 0:3], q, states[..., 7:]], dim=-1)
+        return disp_n, states
+
