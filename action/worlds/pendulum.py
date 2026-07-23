@@ -84,7 +84,12 @@ class ChainPendulum(MujocoWorld):
 
     @property
     def target_index(self) -> int:
-        return self.n - 1        # the swinging tip — the richest motion in the chain
+        # The LAST link — the richest, most chaotic motion in the chain. What gets
+        # recorded is that link's **centre of mass** (see entities.entity_state), not
+        # its free end: the end of the chain is not any body's frame, so tracking it
+        # would need pendulum-specific code, and per-object special cases are exactly
+        # what this project forbids. The CoM is universal and moves genuinely.
+        return self.n - 1
 
     def init_state(self, randomize: bool) -> None:
         if randomize:

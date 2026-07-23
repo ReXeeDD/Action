@@ -59,13 +59,26 @@ def entity_state(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     com-based *spatial* velocity referenced to the subtree centre of mass, so for a
     body that is spinning or far from that reference it is not the body's own linear
     velocity — using it silently produces wrong speeds.
+
+    Position is `xipos` (the **centre of mass**), NOT `xpos` (the body *frame*
+    origin). This matters enormously and was once a silent, data-corrupting bug.
+    `mj_objectVelocity` reports the velocity **at the centre of mass**, so pairing it
+    with `xpos` describes two different points in the same 13-vector. For a free body
+    the two coincide (the geom is centred on its frame), so leaf/ball/object were
+    unaffected — but a pendulum link's frame sits at its *hinge* while its CoM sits
+    half a link away. The recorded pendulum state then said "you are at a point that
+    never moves, travelling at 0.8 m/s": `d(pos)/dt` disagreed with `linvel` by 79%
+    for a double pendulum and by **100%** for a single one, whose target position was
+    the fixed pivot and therefore literally constant. That is physically impossible
+    data, and no model can learn it. The CoM is also the physically right choice:
+    Newton's law F = m*a holds at the centre of mass.
     """
     n = n_entities(model)
     out = np.zeros((n, ENTITY_DIM), dtype=np.float32)
     res = np.zeros(6, dtype=np.float64)
     for i in range(n):
         b = i + 1                                   # skip worldbody
-        out[i, POS] = data.xpos[b]
+        out[i, POS] = data.xipos[b]                 # centre of mass (see above)
         out[i, QUAT] = data.xquat[b]
         # world-frame velocity of this body: res = [angular(3), linear(3)]
         mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, b, res, 0)

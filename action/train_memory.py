@@ -189,7 +189,9 @@ def mem_predict(net, hist_cap, fm, fs, dm, dsd, history, cur, n_steps, device="c
 def _diagnostics(ckpt, data, dev="cpu"):
     net, hist_cap, fm, fs, dm, dsd = load_mem(ckpt, dev)
     eps = load_episodes(data)
-    ev = eps[1400:1470]
+    # evaluate on the tail of the dataset (a hardcoded eps[1400:1470] silently
+    # produced an EMPTY set — and a crash — on any dataset smaller than that)
+    ev = eps[-70:] if len(eps) > 70 else eps
     dt = 0.008
 
     # (1) window: predict to landing from an early point (12 frames watched)
