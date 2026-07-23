@@ -262,6 +262,41 @@ def train(args):
         return max(16, int(round((args.curriculum + (1 - args.curriculum) * ramp)
                                  * args.fut_cap)))
 
+    # ---- memory probe -------------------------------------------------------
+    # The curriculum grows the rollout horizon every epoch, and the flow-map
+    # decoder's activations are B x H x hidden — linear in H. So a batch that fits
+    # comfortably at H=84 can OOM at H=240 *four epochs later*, after 8 minutes of
+    # apparently healthy training. Run one forward+backward at the FULL horizon now,
+    # so an oversized batch fails in seconds with an actionable message.
+    if dev.startswith("cuda"):
+        net.train()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                probe_loss, *_ = losses(next(iter(dl)), True, args.fut_cap)
+            scaler.scale(probe_loss).backward()
+        except torch.OutOfMemoryError:
+            free, total = torch.cuda.mem_get_info()
+            raise SystemExit(
+                f"\nOOM during the memory probe at the FULL horizon H={args.fut_cap}.\n"
+                f"  Peak memory scales with batch x horizon. --batch {args.batch} does "
+                f"not fit at H={args.fut_cap}\n"
+                f"  even though it would fit at the curriculum's first horizon "
+                f"H={horizon_for(0)}.\n"
+                f"  Retry with --batch {max(64, int(args.batch * 0.45))} "
+                f"(or lower --fut-cap / --hidden).\n"
+                f"  GPU: {total/2**30:.1f} GiB total, {free/2**30:.1f} GiB free.\n")
+        finally:
+            opt.zero_grad(set_to_none=True)
+        peak = torch.cuda.max_memory_allocated() / 2 ** 30
+        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        hit = next((e + 1 for e in range(args.epochs)
+                    if horizon_for(e) >= args.fut_cap), None)
+        when = f"the curriculum reaches it at epoch {hit}" if hit else \
+               "the curriculum never reaches it in this run"
+        print(f"memory probe at H={args.fut_cap}: OK, peak {peak:.1f} GiB "
+              f"(the WORST case; {when})", flush=True)
+
     best = float("inf")
     for ep in range(args.epochs):
         H = horizon_for(ep)
